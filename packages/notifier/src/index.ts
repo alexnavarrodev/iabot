@@ -90,9 +90,12 @@ class Notifier {
       log.info({ lastRoundtripId: latestId, equityHwm: equity }, 'bootstrap state');
     }
 
+    log.info('sending hello message to telegram');
     await this.telegram.send('🟢 *GRVT Grid Notifier online*');
+    log.info('hello sent — scheduling first tick');
 
     this.scheduleNext();
+    log.info({ pollMs: this.cfg.pollMs }, 'first tick scheduled — entering loop');
   }
 
   private scheduleNext(): void {
@@ -102,7 +105,13 @@ class Notifier {
         log.error({ err: (err as Error).message }, 'tick errored');
       });
     }, this.cfg.pollMs);
-    this.timer.unref?.();
+    // NB: do NOT unref the timer. The notifier is loop-driven — there's no
+    // HTTP server or other long-lived handle keeping the event loop alive.
+    // If we unref, Node decides "nothing left to do" and exits cleanly
+    // ~1s after main() returns, before the first tick ever fires.
+    // (Bug discovered in production deploy 2026-04-07: process exited 0
+    //  immediately after `bootstrap state` log, no Telegram message ever
+    //  sent. systemd kept restart-looping it.)
   }
 
   private async tick(): Promise<void> {
@@ -228,10 +237,27 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('uncaughtException', (err) => {
-    log.fatal({ err: err.message, stack: err.stack }, 'uncaught');
+    log.fatal({ err: err.message, stack: err.stack }, 'uncaught exception');
+    process.exit(1);
+  });
+  process.on('unhandledRejection', (reason) => {
+    log.fatal(
+      { reason: reason instanceof Error ? reason.message : String(reason) },
+      'unhandled promise rejection'
+    );
+    process.exit(1);
+  });
+  process.on('exit', (code) => {
+    log.info({ code }, 'process exiting');
   });
 
   await notifier.start();
 }
 
-void main();
+main().catch((err) => {
+  log.fatal(
+    { err: err instanceof Error ? err.message : String(err), stack: err instanceof Error ? err.stack : undefined },
+    'main() failed during boot'
+  );
+  process.exit(1);
+});
