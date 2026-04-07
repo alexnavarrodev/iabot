@@ -16,6 +16,8 @@ import {
   type HealthV2,
   type Roundtrip,
   type Trade,
+  type ValidateBotInput,
+  type ValidateBotResult,
 } from './api-types';
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '';
@@ -82,6 +84,12 @@ export const api = {
     request<{ roundtrips: Roundtrip[]; count: number; totalProfit: number }>(
       `/bots/${id}/roundtrips`
     ),
+
+  validateBot: (input: ValidateBotInput) =>
+    request<ValidateBotResult>('/bots/validate', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
 
   getCandles: (
     pair: string,

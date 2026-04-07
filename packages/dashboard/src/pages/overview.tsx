@@ -1,19 +1,22 @@
+// Overview page — multi-bot dashboard with stat-strip + BotCard grid + create CTA.
+
 import { useQuery } from '@tanstack/react-query';
 import { useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Plus } from 'lucide-react';
 import { api } from '@/lib/api-client';
 import { useWsChannel } from '@/lib/use-ws-channel';
-import { formatPercent, formatPnl, formatSize, formatUsd } from '@/lib/format';
+import { formatPercent, formatPnl, formatUsd } from '@/lib/format';
 import { StatCard } from '@/components/primitives/stat-card';
-import { StatusPill } from '@/components/primitives/status-pill';
 import { Delta } from '@/components/primitives/delta';
+import { Button } from '@/components/primitives/button';
 import { Card } from '@/components/primitives/card';
-import { Mono } from '@/components/primitives/mono';
+import { BotCard } from '@/components/bot-card';
+import { CreateBotWizard } from '@/components/create-bot-wizard';
+import type { BotSummary } from '@/lib/api-types';
 
-// Live tick payload as published by ws-dispatcher.ts (channel `bot:N`).
 interface BotTick {
   id: number;
-  status: 'running' | 'paused' | 'stopped' | 'error';
+  status: BotSummary['status'];
   positionSize: number;
   avgEntryPrice: number;
   gridProfit: number;
@@ -28,18 +31,19 @@ export function OverviewPage() {
     staleTime: 5_000,
   });
 
-  // Live state from WS — falls back to REST data if WS is closed.
-  const [tick, setTick] = useState<BotTick | null>(null);
+  // Live ticks per bot, keyed by id.
+  const [ticks, setTicks] = useState<Record<number, BotTick>>({});
+  // For now we only listen to bot:42; multi-bot WS subscription comes when
+  // there are actually multiple bots.
   useWsChannel<BotTick>('bot:42', (msg) => {
-    if (msg.type === 'tick') setTick(msg.data);
+    if (msg.type === 'tick') {
+      setTicks((t) => ({ ...t, [msg.data.id]: msg.data }));
+    }
   });
 
-  const bot = botsQuery.data?.bots.find((b) => b.id === 42) ?? botsQuery.data?.bots[0];
+  const [wizardOpen, setWizardOpen] = useState(false);
 
-  if (botsQuery.isPending) {
-    return <PageSkeleton />;
-  }
-
+  if (botsQuery.isPending) return <PageSkeleton />;
   if (botsQuery.isError) {
     return (
       <Card className="border-danger/40">
@@ -51,52 +55,61 @@ export function OverviewPage() {
         </p>
         <p className="text-xs text-text-muted mt-3">
           Check that <code className="font-mono">VITE_DASHBOARD_API_KEY</code>{' '}
-          is set in <code className="font-mono">.env.local</code>, and that the
-          backend is reachable via the Vite proxy or{' '}
-          <code className="font-mono">VITE_API_BASE_URL</code>.
+          is set in <code className="font-mono">.env.local</code>.
         </p>
       </Card>
     );
   }
 
-  if (!bot) {
-    return (
-      <Card>
-        <h2 className="text-lg font-semibold mb-2">No bots yet</h2>
-        <p className="text-sm text-text-muted">
-          Create your first grid bot to start trading.
-        </p>
-      </Card>
-    );
+  const bots = botsQuery.data?.bots ?? [];
+
+  // Aggregate equity / pnl across all bots, preferring tick data when present.
+  let totalEquity = 0;
+  let totalInvested = 0;
+  let totalPnl = 0;
+  let totalRealized = 0;
+  let totalUnrealized = 0;
+  let runningCount = 0;
+
+  for (const bot of bots) {
+    const tick = ticks[bot.id];
+    const status = tick?.status ?? bot.status;
+    const pnl = tick?.totalPnl ?? bot.total_pnl_usdt;
+    const realized = tick?.gridProfit ?? bot.grid_profit_usdt;
+    const unrealized = tick?.trendPnl ?? bot.trend_pnl_usdt;
+    totalInvested += bot.investment_usdt;
+    totalEquity += bot.investment_usdt + pnl;
+    totalPnl += pnl;
+    totalRealized += realized;
+    totalUnrealized += unrealized;
+    if (status === 'running') runningCount++;
   }
 
-  // Prefer live tick fields when available; fall back to REST.
-  const status = tick?.status ?? bot.status;
-  const positionSize = tick?.positionSize ?? bot.position_size;
-  const avgEntry = tick?.avgEntryPrice ?? bot.avg_entry_price;
-  const totalPnl = tick?.totalPnl ?? bot.total_pnl_usdt;
-  const gridProfit = tick?.gridProfit ?? bot.grid_profit_usdt;
-  const trendPnl = tick?.trendPnl ?? bot.trend_pnl_usdt;
-  const equity = bot.investment_usdt + totalPnl;
-  const equityPct = (totalPnl / bot.investment_usdt) * 100;
+  const totalPct = totalInvested > 0 ? (totalPnl / totalInvested) * 100 : 0;
 
   return (
     <div className="flex flex-col gap-6">
-      {/* Page header */}
-      <div className="flex items-center gap-3 flex-wrap">
-        <h1 className="text-2xl font-semibold tracking-tight">Overview</h1>
-        <StatusPill status={status} />
-        <span className="text-sm text-text-muted">
-          {bot.pair} · {bot.direction.toUpperCase()} · {bot.leverage}x
-        </span>
+      {/* Page header + create CTA */}
+      <div className="flex items-center justify-between gap-4 flex-wrap">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Overview</h1>
+          <p className="text-sm text-text-muted mt-1">
+            {bots.length} {bots.length === 1 ? 'bot' : 'bots'} ·{' '}
+            <span className="text-success">{runningCount} running</span>
+          </p>
+        </div>
+        <Button onClick={() => setWizardOpen(true)}>
+          <Plus className="size-4" />
+          New bot
+        </Button>
       </div>
 
-      {/* Top stat strip */}
+      {/* Aggregate stat strip */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-px bg-border-subtle rounded-lg overflow-hidden">
         <StatCard
-          label="Equity"
-          value={formatUsd(equity)}
-          delta={<Delta value={equityPct} format={formatPercent} />}
+          label="Total equity"
+          value={formatUsd(totalEquity)}
+          delta={<Delta value={totalPct} format={formatPercent} />}
         />
         <StatCard
           label="Total PnL"
@@ -113,85 +126,56 @@ export function OverviewPage() {
               {formatPnl(totalPnl)}
             </span>
           }
-          delta={<Delta value={gridProfit} format={formatPnl} />}
         />
+        <StatCard label="Realized" value={formatPnl(totalRealized)} />
         <StatCard
-          label="Position"
-          value={`${formatSize(positionSize)} ETH`}
-          delta={
-            <span className="text-xs text-text-muted">
-              @ <Mono>{formatUsd(avgEntry)}</Mono>
-            </span>
-          }
-        />
-        <StatCard
-          label="Trend PnL"
+          label="Unrealized"
           value={
             <span
               className={
-                trendPnl > 0
+                totalUnrealized > 0
                   ? 'text-success'
-                  : trendPnl < 0
+                  : totalUnrealized < 0
                     ? 'text-danger'
                     : 'text-text-primary'
               }
             >
-              {formatPnl(trendPnl)}
+              {formatPnl(totalUnrealized)}
             </span>
           }
         />
       </div>
 
-      {/* Bot summary card */}
-      <Card>
-        <div className="flex items-start justify-between mb-4">
-          <div>
-            <h2 className="text-base font-semibold">{bot.pair}</h2>
-            <p className="text-2xs uppercase tracking-wider text-text-muted mt-0.5">
-              {bot.direction} · {bot.leverage}x
-            </p>
-          </div>
-          <StatusPill status={status} />
+      {/* BotCard grid */}
+      <div>
+        <h2 className="text-sm font-semibold text-text-secondary uppercase tracking-wider mb-3">
+          Bots
+        </h2>
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+          {bots.map((bot) => (
+            <BotCard key={bot.id} bot={bot} tick={ticks[bot.id] ?? null} />
+          ))}
+          {/* Create-new tile */}
+          <button
+            type="button"
+            onClick={() => setWizardOpen(true)}
+            className="rounded-lg border border-dashed border-border-default hover:border-primary hover:bg-primary-soft/30 transition-colors p-5 min-h-[280px] flex flex-col items-center justify-center gap-3 text-text-muted hover:text-primary"
+          >
+            <div className="size-12 rounded-full bg-bg-elevated flex items-center justify-center">
+              <Plus className="size-6" />
+            </div>
+            <div className="text-sm font-semibold">Create new bot</div>
+            <div className="text-2xs text-center max-w-[200px]">
+              Launch a new grid bot with the wizard
+            </div>
+          </button>
         </div>
-        <dl className="grid grid-cols-2 gap-x-6 gap-y-3 text-xs">
-          <SummaryRow
-            label="Range"
-            value={`${formatUsd(bot.lower_price)} — ${formatUsd(bot.upper_price)}`}
-          />
-          <SummaryRow label="Grids" value={`${bot.num_grids} levels`} />
-          <SummaryRow label="Investment" value={formatUsd(bot.investment_usdt)} />
-          <SummaryRow
-            label="Liquidation"
-            value={
-              bot.liquidation_price != null
-                ? formatUsd(bot.liquidation_price)
-                : '—'
-            }
-          />
-          <SummaryRow label="Realized" value={formatPnl(gridProfit)} />
-          <SummaryRow label="Unrealized" value={formatPnl(trendPnl)} />
-        </dl>
-      </Card>
+      </div>
 
-      <Link
-        to={`/bots/${bot.id}`}
-        className="inline-flex items-center gap-2 text-sm text-primary hover:text-primary-strong transition-colors"
-      >
-        Open bot detail →
-      </Link>
-    </div>
-  );
-}
-
-function SummaryRow({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="flex items-baseline justify-between border-b border-border-subtle pb-2">
-      <dt className="text-2xs uppercase tracking-wider text-text-muted">
-        {label}
-      </dt>
-      <dd>
-        <Mono>{value}</Mono>
-      </dd>
+      <CreateBotWizard
+        open={wizardOpen}
+        onClose={() => setWizardOpen(false)}
+      />
     </div>
   );
 }
@@ -199,13 +183,17 @@ function SummaryRow({ label, value }: { label: string; value: string }) {
 function PageSkeleton() {
   return (
     <div className="flex flex-col gap-6 animate-pulse">
-      <div className="h-8 w-32 bg-bg-elevated rounded" />
+      <div className="h-8 w-48 bg-bg-elevated rounded" />
       <div className="grid grid-cols-2 md:grid-cols-4 gap-px bg-border-subtle rounded-lg overflow-hidden">
         {[0, 1, 2, 3].map((i) => (
           <div key={i} className="h-24 bg-bg-elevated" />
         ))}
       </div>
-      <div className="h-48 bg-bg-elevated rounded-lg" />
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+        {[0, 1, 2].map((i) => (
+          <div key={i} className="h-72 bg-bg-elevated rounded-lg" />
+        ))}
+      </div>
     </div>
   );
 }

@@ -1,19 +1,33 @@
-// Bot Detail page — hosts the GridChart hero plus a header strip and a
-// stats summary. The fills/orders/funding tabs land in B.5; this page is
-// scoped to "show me the chart" for B.4.
+// Bot Detail page — GridChart hero + 6-card stat strip + secondary equity
+// curve / stats panel + tabs for Fills/Snapshots.
 
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEffect, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { api } from '@/lib/api-client';
-import type { GridLevel, GridState } from '@/lib/api-types';
+import type {
+  DailySnapshot,
+  GridLevel,
+  GridState,
+  Trade,
+} from '@/lib/api-types';
 import { useWsChannel } from '@/lib/use-ws-channel';
-import { formatPercent, formatPnl, formatSize, formatUsd } from '@/lib/format';
+import {
+  formatPercent,
+  formatPnl,
+  formatSize,
+  formatTimeUtc,
+  formatUsd,
+} from '@/lib/format';
 import { Card } from '@/components/primitives/card';
 import { Mono } from '@/components/primitives/mono';
 import { StatCard } from '@/components/primitives/stat-card';
 import { StatusPill } from '@/components/primitives/status-pill';
 import { Delta } from '@/components/primitives/delta';
+import { Tabs } from '@/components/primitives/tabs';
+import { DataTable, type Column } from '@/components/primitives/data-table';
+import { EquityCurve } from '@/components/charts/equity-curve';
+import { StatsPanel } from '@/components/stats-panel';
 import {
   FILL_FLASH_DURATION_MS,
   GridChart,
@@ -242,8 +256,271 @@ export function BotDetailPage() {
           )}
         </div>
       </Card>
+
+      {/* Equity curve + stats panel */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <Card className="lg:col-span-2 p-5">
+          <h3 className="text-sm font-semibold text-text-primary mb-4">
+            Equity curve
+          </h3>
+          <BotDetailEquityCurve botId={botId} />
+        </Card>
+        <StatsPanel bot={bot} />
+      </div>
+
+      {/* Tabs */}
+      <BotDetailTabs botId={botId} />
     </div>
   );
+}
+
+// ── Tabs (Fills + Snapshots for B.5; Orders/Funding deferred) ─────────
+
+function BotDetailTabs({ botId }: { botId: number }) {
+  const [tab, setTab] = useState<'fills' | 'snapshots'>('fills');
+
+  const tradesQuery = useQuery({
+    queryKey: ['trades', botId],
+    queryFn: () => api.getTrades(botId, { limit: 200 }),
+    refetchInterval: 10_000,
+  });
+
+  const snapshotsQuery = useQuery({
+    queryKey: ['snapshots', botId],
+    queryFn: () => api.getSnapshots(botId),
+    staleTime: 5 * 60_000,
+  });
+
+  return (
+    <Card className="p-0 overflow-hidden">
+      <div className="px-5 pt-3">
+        <Tabs
+          items={[
+            {
+              value: 'fills',
+              label: 'Fills',
+              badge: tradesQuery.data?.trades.length ?? '—',
+            },
+            {
+              value: 'snapshots',
+              label: 'Snapshots',
+              badge: snapshotsQuery.data?.snapshots.length ?? '—',
+            },
+          ]}
+          value={tab}
+          onChange={(v) => setTab(v as 'fills' | 'snapshots')}
+        >
+          {tab === 'fills' && (
+            <FillsTable trades={tradesQuery.data?.trades ?? []} loading={tradesQuery.isPending} />
+          )}
+          {tab === 'snapshots' && (
+            <SnapshotsTable
+              snapshots={snapshotsQuery.data?.snapshots ?? []}
+              loading={snapshotsQuery.isPending}
+            />
+          )}
+        </Tabs>
+      </div>
+    </Card>
+  );
+}
+
+const FILLS_COLUMNS: Column<Trade>[] = [
+  {
+    key: 'time',
+    header: 'Time (UTC)',
+    render: (r) => formatTimeUtc(new Date(r.created_at).getTime()),
+    sortValue: (r) => new Date(r.created_at).getTime(),
+    mono: true,
+    width: '160px',
+  },
+  {
+    key: 'side',
+    header: 'Side',
+    render: (r) => (
+      <span
+        className={
+          r.side === 'buy'
+            ? 'text-success font-semibold uppercase'
+            : 'text-danger font-semibold uppercase'
+        }
+      >
+        {r.side}
+      </span>
+    ),
+    align: 'center',
+    width: '80px',
+  },
+  {
+    key: 'price',
+    header: 'Price',
+    render: (r) => formatUsd(r.price),
+    sortValue: (r) => r.price,
+    align: 'right',
+    mono: true,
+  },
+  {
+    key: 'qty',
+    header: 'Size',
+    render: (r) => formatSize(r.quantity),
+    sortValue: (r) => r.quantity,
+    align: 'right',
+    mono: true,
+  },
+  {
+    key: 'fee',
+    header: 'Fee',
+    render: (r) => formatUsd(r.fee),
+    sortValue: (r) => r.fee,
+    align: 'right',
+    mono: true,
+  },
+  {
+    key: 'profit',
+    header: 'RT profit',
+    render: (r) =>
+      r.round_trip_profit != null ? (
+        <span
+          className={
+            r.round_trip_profit > 0
+              ? 'text-success'
+              : r.round_trip_profit < 0
+                ? 'text-danger'
+                : ''
+          }
+        >
+          {formatPnl(r.round_trip_profit)}
+        </span>
+      ) : (
+        <span className="text-text-disabled">—</span>
+      ),
+    sortValue: (r) => r.round_trip_profit ?? 0,
+    align: 'right',
+    mono: true,
+  },
+];
+
+function FillsTable({ trades, loading }: { trades: Trade[]; loading: boolean }) {
+  if (loading) {
+    return (
+      <div className="text-center py-8 text-sm text-text-muted animate-pulse">
+        Loading trades…
+      </div>
+    );
+  }
+  return (
+    <DataTable
+      rows={trades}
+      columns={FILLS_COLUMNS}
+      pageSize={20}
+      rowKey={(r) => r.id}
+      emptyMessage="No fills yet"
+    />
+  );
+}
+
+const SNAPSHOT_COLUMNS: Column<DailySnapshot>[] = [
+  {
+    key: 'date',
+    header: 'Date',
+    render: (r) => r.date,
+    sortValue: (r) => r.date,
+    mono: true,
+    width: '140px',
+  },
+  {
+    key: 'equity',
+    header: 'Equity',
+    render: (r) => formatUsd(r.equity_usdt),
+    sortValue: (r) => r.equity_usdt,
+    align: 'right',
+    mono: true,
+  },
+  {
+    key: 'realized',
+    header: 'Realized',
+    render: (r) => formatPnl(r.realized_pnl_usdt),
+    sortValue: (r) => r.realized_pnl_usdt,
+    align: 'right',
+    mono: true,
+  },
+  {
+    key: 'unrealized',
+    header: 'Unrealized',
+    render: (r) => (
+      <span
+        className={
+          r.unrealized_pnl_usdt > 0
+            ? 'text-success'
+            : r.unrealized_pnl_usdt < 0
+              ? 'text-danger'
+              : ''
+        }
+      >
+        {formatPnl(r.unrealized_pnl_usdt)}
+      </span>
+    ),
+    sortValue: (r) => r.unrealized_pnl_usdt,
+    align: 'right',
+    mono: true,
+  },
+  {
+    key: 'rt',
+    header: 'Round trips',
+    render: (r) => String(r.num_round_trips),
+    sortValue: (r) => r.num_round_trips,
+    align: 'right',
+    mono: true,
+  },
+  {
+    key: 'fees',
+    header: 'Fees',
+    render: (r) => formatUsd(r.total_fees_usdt),
+    sortValue: (r) => r.total_fees_usdt,
+    align: 'right',
+    mono: true,
+  },
+];
+
+function SnapshotsTable({
+  snapshots,
+  loading,
+}: {
+  snapshots: DailySnapshot[];
+  loading: boolean;
+}) {
+  if (loading) {
+    return (
+      <div className="text-center py-8 text-sm text-text-muted animate-pulse">
+        Loading snapshots…
+      </div>
+    );
+  }
+  return (
+    <DataTable
+      rows={snapshots}
+      columns={SNAPSHOT_COLUMNS}
+      pageSize={20}
+      rowKey={(r) => r.id}
+      emptyMessage="No snapshots yet"
+    />
+  );
+}
+
+function BotDetailEquityCurve({ botId }: { botId: number }) {
+  const snapshotsQuery = useQuery({
+    queryKey: ['snapshots', botId],
+    queryFn: () => api.getSnapshots(botId),
+    staleTime: 5 * 60_000,
+  });
+  if (snapshotsQuery.isPending) {
+    return (
+      <div className="h-60 flex items-center justify-center text-sm text-text-muted animate-pulse">
+        Loading…
+      </div>
+    );
+  }
+  return <EquityCurve snapshots={snapshotsQuery.data?.snapshots ?? []} />;
 }
 
 function ChartLegend() {

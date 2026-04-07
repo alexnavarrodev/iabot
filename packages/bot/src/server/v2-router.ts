@@ -35,6 +35,11 @@ export interface V2RouterDeps {
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────
+function round(n: number, digits: number): number {
+  const f = 10 ** digits;
+  return Math.round(n * f) / f;
+}
+
 function dbAll<T = unknown>(db: Database.Database, sql: string, params: unknown[] = []): Promise<T[]> {
   return new Promise((resolve, reject) => {
     db.all(sql, params, (err, rows) => {
@@ -253,6 +258,95 @@ export function createV2Router(deps: V2RouterDeps): Router {
       SELECT COUNT(*) as c, COALESCE(SUM(profit), 0) as sum FROM paired_roundtrips
     `);
     res.json({ roundtrips, count: total?.c ?? 0, totalProfit: total?.sum ?? 0 });
+    return;
+  }));
+
+  // ── POST /api/v2/bots/validate ────────────────────────────────────
+  // DRY-RUN endpoint for the Create Bot Wizard. Validates the proposed
+  // config and returns the computed grid parameters (spacing, qty/level,
+  // estimated profit per round-trip, liquidation distance) WITHOUT
+  // actually creating a bot or placing any orders. The wizard uses this
+  // for the live preview in steps 3 and 4.
+  //
+  // The actual bot creation flow goes via a separate POST /bots endpoint
+  // that lands in B.5.1 — kept off the v0 surface to protect the live
+  // bot from accidental sibling-bot creation during dashboard development.
+  router.post('/bots/validate', asyncHandler(async (req, res) => {
+    const body = (req.body ?? {}) as Partial<{
+      pair: string;
+      direction: 'long' | 'short';
+      lower_price: number;
+      upper_price: number;
+      num_grids: number;
+      investment_usdt: number;
+      leverage: number;
+    }>;
+
+    const errors: string[] = [];
+    const pair = String(body.pair ?? '').trim();
+    if (!pair) errors.push('pair is required');
+    const direction = body.direction === 'short' ? 'short' : 'long';
+    const lower = Number(body.lower_price);
+    const upper = Number(body.upper_price);
+    const grids = Number(body.num_grids);
+    const investment = Number(body.investment_usdt);
+    const leverage = Number(body.leverage);
+
+    if (!Number.isFinite(lower) || lower <= 0) errors.push('lower_price must be > 0');
+    if (!Number.isFinite(upper) || upper <= 0) errors.push('upper_price must be > 0');
+    if (lower >= upper) errors.push('lower_price must be < upper_price');
+    if (!Number.isInteger(grids) || grids < 2 || grids > 95) {
+      errors.push('num_grids must be an integer between 2 and 95');
+    }
+    if (!Number.isFinite(investment) || investment <= 0) errors.push('investment_usdt must be > 0');
+    if (!Number.isFinite(leverage) || leverage < 1 || leverage > 50) {
+      errors.push('leverage must be between 1 and 50');
+    }
+
+    if (errors.length > 0) {
+      return res.status(400).json({ error: 'validation_failed', errors });
+    }
+
+    // Computed parameters — must mirror grid-engine.ts so the wizard preview
+    // matches reality. If the engine ever changes its math, update this too.
+    const spacing = (upper - lower) / (grids - 1);
+    const notional = investment * leverage;
+    const qtyPerLevel = notional / grids / ((upper + lower) / 2);
+    const profitPerRoundTrip = qtyPerLevel * spacing;
+
+    // Estimated liquidation: simplified — actual depends on funding/fees.
+    // For LONG: liq ≈ avg_entry * (1 - 1/leverage * 0.95)
+    const midPrice = (upper + lower) / 2;
+    const liquidationEstimate =
+      direction === 'long'
+        ? midPrice * (1 - (1 / leverage) * 0.95)
+        : midPrice * (1 + (1 / leverage) * 0.95);
+    const liqDistancePct = ((midPrice - liquidationEstimate) / midPrice) * 100;
+
+    // Tier 1 GRVT account is capped to 100 open orders. We hard-cap at 95
+    // here too so there's room for replacement orders during round-trips.
+    const overOrderCap = grids > 95;
+
+    res.json({
+      valid: true,
+      pair,
+      direction,
+      input: { lower, upper, grids, investment, leverage },
+      computed: {
+        spacing: round(spacing, 4),
+        spacingPct: round((spacing / midPrice) * 100, 3),
+        qtyPerLevel: round(qtyPerLevel, 6),
+        notional: round(notional, 2),
+        profitPerRoundTrip: round(profitPerRoundTrip, 4),
+        midPrice: round(midPrice, 2),
+        liquidationEstimate: round(liquidationEstimate, 2),
+        liqDistancePct: round(liqDistancePct, 2),
+      },
+      warnings: [
+        ...(overOrderCap ? ['num_grids over GRVT Tier 1 cap (95)'] : []),
+        ...(leverage > 20 ? ['leverage > 20x: liquidation risk is high'] : []),
+      ],
+    });
     return;
   }));
 

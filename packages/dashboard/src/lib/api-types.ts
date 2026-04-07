@@ -79,6 +79,40 @@ export interface Roundtrip {
   created_at: string;
 }
 
+export interface ValidateBotInput {
+  pair: string;
+  direction: 'long' | 'short';
+  lower_price: number;
+  upper_price: number;
+  num_grids: number;
+  investment_usdt: number;
+  leverage: number;
+}
+
+export interface ValidateBotResult {
+  valid: true;
+  pair: string;
+  direction: 'long' | 'short';
+  input: {
+    lower: number;
+    upper: number;
+    grids: number;
+    investment: number;
+    leverage: number;
+  };
+  computed: {
+    spacing: number;
+    spacingPct: number;
+    qtyPerLevel: number;
+    notional: number;
+    profitPerRoundTrip: number;
+    midPrice: number;
+    liquidationEstimate: number;
+    liqDistancePct: number;
+  };
+  warnings: string[];
+}
+
 // Kline / candlestick — both timestamps in unix MILLISECONDS (not ns).
 // The bot's getKlines() already converts the GRVT ns string format.
 export interface Candle {

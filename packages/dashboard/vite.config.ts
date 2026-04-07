@@ -15,6 +15,22 @@ export default defineConfig({
       '@': path.resolve(__dirname, './src'),
     },
   },
+  build: {
+    rollupOptions: {
+      output: {
+        // Split heavy chart libs into their own vendor chunks so the
+        // initial app shell stays small. The browser caches them
+        // separately and the wizard/detail pages lazy-load them.
+        manualChunks: {
+          'vendor-react': ['react', 'react-dom', 'react-router-dom'],
+          'vendor-charts-lwc': ['lightweight-charts'],
+          'vendor-charts-recharts': ['recharts'],
+          'vendor-query': ['@tanstack/react-query'],
+        },
+      },
+    },
+    chunkSizeWarningLimit: 600,
+  },
   server: {
     port: 5173,
     proxy: {
