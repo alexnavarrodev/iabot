@@ -8,6 +8,7 @@ dns.setDefaultResultOrder('ipv4first');
 import express from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
+import fs from 'node:fs';
 import { fileURLToPath } from 'url';
 import { createServer } from 'node:http';
 import { grvtClient } from '../api/client.js';
@@ -985,6 +986,35 @@ console.log(`📁 Serving static files from: ${publicPath}`);
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
+
+// === V2 DASHBOARD (React SPA, gated by basic auth like the legacy one) ===
+// Looks for the prebuilt SPA at /opt/grvt-grid-bot/dashboard-dist (production)
+// or ../../dashboard-dist relative to dist/ during local dev. If neither exists,
+// this is a no-op so the bot still boots without the new dashboard.
+const dashV2Candidates = [
+  process.env.DASHBOARD_V2_DIST,
+  '/opt/grvt-grid-bot/dashboard-dist',
+  path.join(__dirname, '..', '..', 'dashboard-dist'),
+].filter((p): p is string => !!p);
+const dashV2Path = dashV2Candidates.find((p) => {
+  try { return fs.existsSync(path.join(p, 'index.html')); } catch { return false; }
+});
+if (dashV2Path) {
+  app.use('/dashboard', express.static(dashV2Path));
+  // SPA fallback: any deep link / refresh under /dashboard/* serves index.html
+  // so the React Router can take over client-side. Excludes static assets
+  // (already handled by express.static above) by checking that the path has
+  // no file extension OR ends in /.
+  app.get(/^\/dashboard(\/.*)?$/, (req, res, next) => {
+    if (path.extname(req.path)) return next();  // let static handle .js/.css
+    res.sendFile(path.join(dashV2Path, 'index.html'), (err) => {
+      if (err) next(err);
+    });
+  });
+  console.log(`📁 Serving v2 dashboard from: ${dashV2Path} (mounted at /dashboard)`);
+} else {
+  console.log(`⚠️  v2 dashboard not deployed (no dashboard-dist found)`);
+}
 
 // === V2 ROUTER PLACEHOLDER ===
 // The v2 surface (REST + WebSocket) is mounted in startServer() AFTER

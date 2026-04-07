@@ -219,8 +219,14 @@ export class GRVTClient {
       type: 'TRADE',
       limit
     });
-    // GRVT returns { result: [...], next: '...' } — flatten the result.
-    const rows: any[] = Array.isArray(data?.result) ? data.result : [];
+    // publicRequest already unwraps `.result` from the GRVT envelope, so
+    // `data` is normally the rows array. But if GRVT ever returns the
+    // wrapped object directly we still want to handle it — accept both.
+    const rows: any[] = Array.isArray(data)
+      ? data
+      : Array.isArray(data?.result)
+        ? data.result
+        : [];
     return rows.map((row): KlineCandle => ({
       openTime: Number(row.open_time) / 1_000_000, // ns string -> ms
       closeTime: Number(row.close_time) / 1_000_000,
