@@ -46,20 +46,29 @@ async function initializeServices() {
 
 // Basic auth middleware
 const basicAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  // Skip basic auth for the v2 surface — it has its own X-Api-Key auth via
+  // the v2 router middleware. Without this skip, the global basicAuth would
+  // 401 every v2 request before the router got a chance to see it.
+  // The /ws upgrade path doesn't go through Express middleware at all (the
+  // ws library handles it on its own), so no skip is needed there.
+  if (req.path.startsWith('/api/v2/')) {
+    return next();
+  }
+
   const authHeader = req.headers.authorization;
-  
+
   if (!authHeader || !authHeader.startsWith('Basic ')) {
     res.setHeader('WWW-Authenticate', 'Basic realm="GRVT Grid Bot Dashboard"');
     return res.status(401).send('Authentication required');
   }
-  
+
   const credentials = Buffer.from(authHeader.slice(6), 'base64').toString();
   const [username, password] = credentials.split(':');
-  
+
   if (username !== process.env.DASHBOARD_USER || password !== process.env.DASHBOARD_PASS) {
     return res.status(401).send('Invalid credentials');
   }
-  
+
   next();
 };
 
@@ -977,6 +986,40 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
+// === V2 ROUTER PLACEHOLDER ===
+// The v2 surface (REST + WebSocket) is mounted in startServer() AFTER
+// initializeServices() so it has access to the live grvtClient + db + engine.
+// Express dispatches middlewares in registration order, so we need v2 to be
+// registered BEFORE the 404 handler below. We do that by calling mountV2()
+// from startServer() and ensuring startServer() runs the wiring before the
+// 404 handler is hit (which only happens at request time, not module load).
+//
+// Concretely: the 404 handler below IS registered at module load, but Express
+// only walks the middleware stack in order at REQUEST time. So as long as
+// mountV2() inserts /api/v2/* into the stack BEFORE a request arrives, it
+// works. We use app._router.stack manipulation to insert at the right
+// position, OR — much simpler — we register a deferred mount middleware
+// here that the bootstrap function fills in.
+//
+// Approach: register a router placeholder NOW (so it's in stack order before
+// the 404), and let mountV2() swap its handler in later via a closure.
+// The placeholder forwards to a dynamically-set router or 404s with a clear
+// message if v2 is disabled.
+//
+// This pattern is safer than reordering startServer because it preserves the
+// module-load-time stack registration order that Express depends on.
+let v2RouterRef: express.Router | null = null;
+export function setV2Router(router: express.Router): void {
+  v2RouterRef = router;
+}
+app.use('/api/v2', (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (v2RouterRef) {
+    v2RouterRef(req, res, next);
+  } else {
+    res.status(503).json({ error: 'v2 surface not configured', hint: 'set DASHBOARD_API_KEY' });
+  }
+});
+
 // === ERROR HANDLING ===
 app.use((req, res) => {
   res.status(404).json({ error: 'Endpoint not found' });
@@ -1197,7 +1240,7 @@ async function startServer() {
     const apiKey = process.env.DASHBOARD_API_KEY;
     if (apiKey && apiKey.length >= 16) {
       mountV2({
-        app,
+        setRouter: setV2Router,
         httpServer,
         db: db.getRawDb(),
         grvtClient,

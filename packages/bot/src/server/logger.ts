@@ -21,7 +21,7 @@ export const rootLogger = pino({
       }
     }
   }),
-  base: undefined  // suppress pid/hostname in every line
+  base: null  // suppress pid/hostname in every line (pino requires null, not undefined)
 });
 
 export function childLogger(subsystem: string, extra: Record<string, unknown> = {}) {

@@ -9,7 +9,7 @@
 // To opt out (for tests, or if the v2 surface should be disabled): just
 // don't call mountV2().
 
-import type { Express } from 'express';
+import type { Express, Router } from 'express';
 import type { Server as HttpServer } from 'node:http';
 import type { EventEmitter } from 'node:events';
 import type Database from 'sqlite3';
@@ -30,7 +30,14 @@ interface GrvtClient {
 }
 
 export interface MountV2Options {
-  app: Express;
+  /**
+   * Receives the constructed v2 REST router. The legacy server.ts uses this
+   * callback to register the router into a placeholder middleware that's
+   * already in the express stack at module-load time, BEFORE the catch-all
+   * 404 handler. Returning a router instead of mounting it ourselves keeps
+   * us out of the request-order trap.
+   */
+  setRouter: (router: Router) => void;
   httpServer: HttpServer;
   db: Database.Database;
   grvtClient: GrvtClient;
@@ -45,13 +52,18 @@ export interface V2Handles {
 }
 
 export function mountV2(opts: MountV2Options): V2Handles {
-  // Mount the v2 REST router
-  opts.app.use('/api/v2', createV2Router({
+  // Build the v2 REST router and hand it to the host app via the callback.
+  // We don't call app.use() ourselves because by the time mountV2() runs
+  // (in startServer, after initializeServices), the legacy 404 handler is
+  // already in the middleware stack. The placeholder pattern in server.ts
+  // is what makes this work.
+  const router = createV2Router({
     db: opts.db,
     grvtClient: opts.grvtClient,
     apiKey: opts.apiKey
-  }));
-  log.info('mounted v2 REST router at /api/v2');
+  });
+  opts.setRouter(router);
+  log.info('built v2 REST router and registered via placeholder');
 
   // Mount the WebSocket server on the same HTTP server
   const wsServer = new GrvtWebSocketServer(opts.httpServer, opts.apiKey);
