@@ -1,0 +1,22 @@
+{
+  "name": "grvt-grid",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted real-time dashboard for grid trading bots on GRVT perpetual futures",
+  "license": "SEE LICENSE",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:bot": "npm run dev --workspace=@grvt-grid/bot",
+    "dev:dashboard": "npm run dev --workspace=@grvt-grid/dashboard",
+    "dev:notifier": "npm run dev --workspace=@grvt-grid/notifier",
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
