@@ -161,9 +161,16 @@ export class GRVTClient {
   private tradingAccountId: string;
 
   constructor() {
-    this.tradingAccountId = process.env.GRVT_TRADING_ACCOUNT_ID!;
+    // MOCK_MODE / DRY_RUN: allow the bot to boot without real GRVT
+    // credentials so self-hosters can take a tour of the dashboard before
+    // they have an account, and so the docker image can be smoke-tested in
+    // CI without secrets. The engine layer (grid-engine.ts) already checks
+    // MOCK_MODE to short-circuit any path that would actually call GRVT,
+    // so the dummy account id never reaches the wire.
+    const isMockMode = process.env.MOCK_MODE === 'true' || process.env.DRY_RUN === 'true';
+    this.tradingAccountId = process.env.GRVT_TRADING_ACCOUNT_ID || (isMockMode ? 'mock-account' : '');
     if (!this.tradingAccountId) {
-      throw new Error('GRVT_TRADING_ACCOUNT_ID no encontrado en .env');
+      throw new Error('GRVT_TRADING_ACCOUNT_ID no encontrado en .env (set MOCK_MODE=true to bypass for development)');
     }
   }
 

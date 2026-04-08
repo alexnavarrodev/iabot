@@ -3,6 +3,7 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { Toaster } from 'sonner';
 import { AppShell } from './components/layout/app-shell';
+import { ConfirmHost } from './components/primitives/confirm-dialog';
 import { OverviewPage } from './pages/overview';
 import { BotsListPage } from './pages/bots-list';
 import { SettingsPage } from './pages/settings';
@@ -64,6 +65,9 @@ export default function App() {
           },
         }}
       />
+      {/* Singleton confirm dialog host. Any component can call useConfirm()
+          and the dialog renders here, no context provider needed. */}
+      <ConfirmHost />
     </QueryClientProvider>
   );
 }

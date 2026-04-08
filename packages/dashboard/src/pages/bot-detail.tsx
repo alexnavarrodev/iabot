@@ -25,6 +25,7 @@ import {
 } from '@/lib/format';
 import { Button } from '@/components/primitives/button';
 import { Card } from '@/components/primitives/card';
+import { useConfirm } from '@/components/primitives/confirm-dialog';
 import { Mono } from '@/components/primitives/mono';
 import { StatCard } from '@/components/primitives/stat-card';
 import { StatusPill } from '@/components/primitives/status-pill';
@@ -180,24 +181,85 @@ export function BotDetailPage() {
     onError: (err: Error) => toast.error(`Pause failed: ${err.message}`),
   });
 
-  function handleStart() {
-    if (
-      !window.confirm(
-        `Start bot ${botId}?\n\nThis will place real orders on GRVT for ${bot.pair} ${bot.direction} ${bot.leverage}x with ${bot.investment_usdt.toFixed(2)} USDT.`
-      )
-    )
-      return;
-    startMutation.mutate();
+  const confirm = useConfirm();
+
+  async function handleStart() {
+    const ok = await confirm({
+      variant: 'warning',
+      title: `Start bot ${botId}?`,
+      description: 'This will place real orders on GRVT.',
+      body: (
+        <div className="space-y-2">
+          <p>The bot will immediately place limit orders on GRVT using:</p>
+          <ul className="list-disc list-inside space-y-0.5 font-mono text-2xs">
+            <li>
+              Pair: <span className="text-text-primary">{bot.pair}</span>
+            </li>
+            <li>
+              Direction:{' '}
+              <span
+                className={
+                  bot.direction === 'long' ? 'text-success' : 'text-danger'
+                }
+              >
+                {bot.direction.toUpperCase()}
+              </span>
+            </li>
+            <li>
+              Leverage:{' '}
+              <span className="text-text-primary">{bot.leverage}x</span>
+            </li>
+            <li>
+              Investment:{' '}
+              <span className="text-text-primary">
+                {formatUsd(bot.investment_usdt)}
+              </span>
+            </li>
+            <li>
+              Range:{' '}
+              <span className="text-text-primary">
+                {formatUsd(bot.lower_price)} — {formatUsd(bot.upper_price)}
+              </span>
+            </li>
+            <li>
+              Grid: <span className="text-text-primary">{bot.num_grids}</span>{' '}
+              levels
+            </li>
+          </ul>
+        </div>
+      ),
+      confirmLabel: 'Start trading',
+      cancelLabel: 'Cancel',
+    });
+    if (ok) startMutation.mutate();
   }
 
-  function handlePause() {
-    if (
-      !window.confirm(
-        `Pause bot ${botId}?\n\nThis will CANCEL ALL open orders on GRVT for ${bot.pair}. The position itself will not be closed — only the limit orders. You can resume later with Start.`
-      )
-    )
-      return;
-    pauseMutation.mutate();
+  async function handlePause() {
+    const openOrderCount = gridStateQuery.data?.openOrders.length ?? 0;
+    const ok = await confirm({
+      variant: 'destructive',
+      title: `Pause bot ${botId}?`,
+      description: `${bot.pair} · ${bot.direction.toUpperCase()} · ${bot.leverage}x`,
+      body: (
+        <div className="space-y-2">
+          <p className="font-semibold text-text-primary">
+            This will <Mono>CANCEL {openOrderCount || 'ALL'}</Mono> open orders
+            on GRVT.
+          </p>
+          <p>
+            The position ({formatSize(positionSize)} ETH @{' '}
+            <Mono>{formatUsd(avgEntry)}</Mono>) will{' '}
+            <strong className="text-text-primary">not</strong> be closed —
+            only the limit orders are cancelled. You can resume the bot later
+            with <strong className="text-text-primary">Start</strong>, which
+            will rebind to whatever orders or position is left.
+          </p>
+        </div>
+      ),
+      confirmLabel: `Cancel ${openOrderCount || 'all'} orders`,
+      cancelLabel: 'Keep running',
+    });
+    if (ok) pauseMutation.mutate();
   }
 
   return (
