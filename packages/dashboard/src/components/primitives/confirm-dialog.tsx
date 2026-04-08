@@ -12,7 +12,7 @@
 // can also drop the <ConfirmDialog> directly with controlled `open`.
 
 import { AlertTriangle } from 'lucide-react';
-import { type ReactNode, useCallback, useState } from 'react';
+import { type ReactNode, useCallback, useEffect, useState } from 'react';
 import { Button } from './button';
 import { Modal } from './modal';
 
@@ -152,14 +152,23 @@ export function useConfirm() {
 }
 
 export function ConfirmHost() {
-  const [tick, setTick] = useState(0);
+  // tick is just a re-render trigger; the actual state lives in the
+  // module-level pendingOptions/pendingResolver.
+  const [, setTick] = useState(0);
 
-  // Subscribe to the bus on mount.
-  useState(() => {
+  // Subscribe to the bus on mount, unsubscribe on unmount.
+  // (The previous version put this inside useState's lazy initializer
+  // which only runs once per state slot, doesn't expose a cleanup, and
+  // returned a function that became the initial state instead of being
+  // run as cleanup. That left a stale listener in the global Set which
+  // mostly worked but doubled up under StrictMode.)
+  useEffect(() => {
     const fn = () => setTick((t) => t + 1);
     listeners.add(fn);
-    return () => listeners.delete(fn);
-  });
+    return () => {
+      listeners.delete(fn);
+    };
+  }, []);
 
   const open = pendingOptions != null;
   const opts = pendingOptions;
@@ -172,18 +181,11 @@ export function ConfirmHost() {
     resolve?.(result);
   }
 
-  // tick is referenced so React re-renders when notify() fires
-  void tick;
-
   if (!open || !opts) {
-    return (
-      <ConfirmDialog
-        open={false}
-        title=""
-        onConfirm={() => undefined}
-        onCancel={() => undefined}
-      />
-    );
+    // Render nothing when there's no pending confirm. Returning the
+    // ConfirmDialog with open=false works too but adds an extra dialog
+    // element to the DOM unnecessarily.
+    return null;
   }
 
   return (

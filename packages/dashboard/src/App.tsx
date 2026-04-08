@@ -3,6 +3,7 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { Toaster } from 'sonner';
 import { AppShell } from './components/layout/app-shell';
+import { ErrorBoundary } from './components/error-boundary';
 import { ConfirmHost } from './components/primitives/confirm-dialog';
 import { OverviewPage } from './pages/overview';
 import { BotsListPage } from './pages/bots-list';
@@ -38,18 +39,41 @@ export default function App() {
       <BrowserRouter basename={import.meta.env.BASE_URL.replace(/\/$/, '')}>
         <Routes>
           <Route element={<AppShell />}>
-            <Route index element={<OverviewPage />} />
-            <Route path="bots" element={<BotsListPage />} />
+            <Route
+              index
+              element={
+                <ErrorBoundary>
+                  <OverviewPage />
+                </ErrorBoundary>
+              }
+            />
+            <Route
+              path="bots"
+              element={
+                <ErrorBoundary>
+                  <BotsListPage />
+                </ErrorBoundary>
+              }
+            />
             <Route
               path="bots/:id"
               element={
-                <Suspense fallback={<RouteFallback />}>
-                  <BotDetailPage />
-                </Suspense>
+                <ErrorBoundary>
+                  <Suspense fallback={<RouteFallback />}>
+                    <BotDetailPage />
+                  </Suspense>
+                </ErrorBoundary>
               }
             />
             <Route path="history" element={<Navigate to="/" replace />} />
-            <Route path="settings" element={<SettingsPage />} />
+            <Route
+              path="settings"
+              element={
+                <ErrorBoundary>
+                  <SettingsPage />
+                </ErrorBoundary>
+              }
+            />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>

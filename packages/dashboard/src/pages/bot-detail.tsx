@@ -129,6 +129,39 @@ export function BotDetailPage() {
     void queryClient.invalidateQueries({ queryKey: ['gridState', botId] });
   });
 
+  // ── ALL hooks must run BEFORE any early return.
+  // Rules of Hooks: the order/count of hook calls must be stable across
+  // every render of the same component instance. The previous version of
+  // this component called useMutation x2 + useConfirm AFTER the
+  // `if (botQuery.isPending) return <PageSkeleton />` early return, so
+  // the hook count went from N (loading) to N+3 (loaded) and React blew
+  // up the render with "rendered more hooks than during the previous
+  // render". The fix is to declare every hook unconditionally up here.
+  const startMutation = useMutation({
+    mutationFn: () => api.startBot(botId),
+    onSuccess: () => {
+      toast.success(`Bot ${botId} started`);
+      void queryClient.invalidateQueries({ queryKey: ['bot', botId] });
+      void queryClient.invalidateQueries({ queryKey: ['bots'] });
+      void queryClient.invalidateQueries({ queryKey: ['gridState', botId] });
+    },
+    onError: (err: Error) => toast.error(`Start failed: ${err.message}`),
+  });
+
+  const pauseMutation = useMutation({
+    mutationFn: () => api.pauseBot(botId),
+    onSuccess: () => {
+      toast.success(`Bot ${botId} paused (orders cancelled on GRVT)`);
+      void queryClient.invalidateQueries({ queryKey: ['bot', botId] });
+      void queryClient.invalidateQueries({ queryKey: ['bots'] });
+      void queryClient.invalidateQueries({ queryKey: ['gridState', botId] });
+    },
+    onError: (err: Error) => toast.error(`Pause failed: ${err.message}`),
+  });
+
+  const confirm = useConfirm();
+
+  // ── Now safe to early-return ──
   if (botQuery.isPending) return <PageSkeleton />;
   if (botQuery.isError) {
     return (
@@ -153,35 +186,11 @@ export function BotDetailPage() {
   const equity = bot.investment_usdt + totalPnl;
   const equityPct = (totalPnl / bot.investment_usdt) * 100;
 
+  // useMarkPrice is a plain helper despite the `use*` name — no hooks
+  // inside it. Safe to call after the early return.
   const markPrice = useMarkPrice(gridStateQuery.data);
   const candles = candlesQuery.data?.candles ?? [];
   const levels: GridLevel[] = gridStateQuery.data?.levels ?? [];
-
-  // Mutations: Start/Pause. Both invalidate the bot list + this bot's
-  // grid-state so the UI reflects the new status immediately.
-  const startMutation = useMutation({
-    mutationFn: () => api.startBot(botId),
-    onSuccess: () => {
-      toast.success(`Bot ${botId} started`);
-      void queryClient.invalidateQueries({ queryKey: ['bot', botId] });
-      void queryClient.invalidateQueries({ queryKey: ['bots'] });
-      void queryClient.invalidateQueries({ queryKey: ['gridState', botId] });
-    },
-    onError: (err: Error) => toast.error(`Start failed: ${err.message}`),
-  });
-
-  const pauseMutation = useMutation({
-    mutationFn: () => api.pauseBot(botId),
-    onSuccess: () => {
-      toast.success(`Bot ${botId} paused (orders cancelled on GRVT)`);
-      void queryClient.invalidateQueries({ queryKey: ['bot', botId] });
-      void queryClient.invalidateQueries({ queryKey: ['bots'] });
-      void queryClient.invalidateQueries({ queryKey: ['gridState', botId] });
-    },
-    onError: (err: Error) => toast.error(`Pause failed: ${err.message}`),
-  });
-
-  const confirm = useConfirm();
 
   async function handleStart() {
     const ok = await confirm({
