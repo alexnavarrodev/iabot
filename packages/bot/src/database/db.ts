@@ -47,6 +47,12 @@ export interface GridBot {
   compound_threshold_usdt?: number;
   compound_interval_hours?: number;
   last_compound_at?: string;
+  // Liquidation proximity safeguard (C.4). Opt-in per bot, configured at
+  // creation. safeguard_enabled=0 means the check is a no-op; the legacy
+  // behavior of not pausing on proximity is preserved.
+  safeguard_enabled?: number;
+  safeguard_threshold_pct?: number;
+  safeguard_action?: 'pause' | 'pause_close';
 }
 
 export interface GridLevel {
@@ -289,6 +295,22 @@ export class GridBotDB {
       )
       WHERE quantity_per_level IS NULL
     `);
+
+    // Migration: safeguard_* columns (C.4). Liquidation proximity check,
+    // opt-in per bot at creation. Legacy bots get safeguard_enabled=0 via
+    // the DEFAULT, so their behavior does not change after this migration.
+    try {
+      await this.dbRun(`ALTER TABLE grid_bots ADD COLUMN safeguard_enabled INTEGER DEFAULT 0`);
+      console.log('✅ Columna safeguard_enabled agregada a grid_bots');
+    } catch (e) { /* already exists */ }
+    try {
+      await this.dbRun(`ALTER TABLE grid_bots ADD COLUMN safeguard_threshold_pct REAL`);
+      console.log('✅ Columna safeguard_threshold_pct agregada a grid_bots');
+    } catch (e) { /* already exists */ }
+    try {
+      await this.dbRun(`ALTER TABLE grid_bots ADD COLUMN safeguard_action TEXT`);
+      console.log('✅ Columna safeguard_action agregada a grid_bots');
+    } catch (e) { /* already exists */ }
 
     // Tabla: bot_cash_movements — explicit ledger for every cash flow
     // touching a bot's notional. Each row records WHY investment_usdt

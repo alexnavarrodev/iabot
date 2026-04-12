@@ -45,6 +45,9 @@ interface WizardState {
   leverage: string;
   acceptedRisk: boolean;
   compoundPct: string;
+  safeguardEnabled: boolean;
+  safeguardThresholdPct: string;
+  safeguardAction: 'pause' | 'pause_close';
 }
 
 const INITIAL_STATE: WizardState = {
@@ -57,6 +60,9 @@ const INITIAL_STATE: WizardState = {
   leverage: '10',
   acceptedRisk: false,
   compoundPct: '0',
+  safeguardEnabled: false,
+  safeguardThresholdPct: '10',
+  safeguardAction: 'pause',
 };
 
 const PAIRS = [
@@ -110,6 +116,16 @@ export function CreateBotWizard({ open, onClose }: CreateBotWizardProps) {
   function handleCreate() {
     if (!validated) return;
     const compoundPct = Math.min(100, Math.max(0, parseInt(state.compoundPct || '0', 10)));
+    const safeguardPayload = state.safeguardEnabled
+      ? {
+          safeguard_enabled: true,
+          safeguard_threshold_pct: Math.min(
+            50,
+            Math.max(1, parseFloat(state.safeguardThresholdPct || '10'))
+          ),
+          safeguard_action: state.safeguardAction,
+        }
+      : {};
     createMutation.mutate({
       pair: validated.pair,
       direction: validated.direction,
@@ -119,6 +135,7 @@ export function CreateBotWizard({ open, onClose }: CreateBotWizardProps) {
       investment_usdt: validated.input.investment,
       leverage: validated.input.leverage,
       ...(compoundPct > 0 ? { compound_pct: compoundPct } : {}),
+      ...safeguardPayload,
     } as any);
   }
 
@@ -128,7 +145,13 @@ export function CreateBotWizard({ open, onClose }: CreateBotWizardProps) {
     // changes — ticking the risk checkbox on step 4 must NOT reset
     // validated, otherwise StepConfirm re-renders to null (line 469)
     // and the checkbox disappears mid-tick, breaking the wizard.
-    if (key !== 'acceptedRisk' && key !== 'compoundPct') {
+    if (
+      key !== 'acceptedRisk' &&
+      key !== 'compoundPct' &&
+      key !== 'safeguardEnabled' &&
+      key !== 'safeguardThresholdPct' &&
+      key !== 'safeguardAction'
+    ) {
       setValidated(null);
     }
   }
@@ -445,6 +468,61 @@ function StepConfig({
         . The next step validates the config and computes spacing, qty/level
         and liquidation distance.
       </p>
+
+      <div className="mt-6 rounded-md border border-border-subtle bg-bg-muted/40 p-4">
+        <label className="flex items-start gap-3 cursor-pointer">
+          <input
+            type="checkbox"
+            className="mt-0.5 size-4 accent-primary"
+            checked={state.safeguardEnabled}
+            onChange={(e) => update('safeguardEnabled', e.target.checked)}
+          />
+          <div className="flex-1">
+            <div className="text-sm font-semibold text-text-primary">
+              Enable liquidation safeguard
+            </div>
+            <div className="text-xs text-text-muted mt-0.5">
+              Auto-pause this bot when the mark price gets within the chosen
+              distance of its estimated liquidation price.
+            </div>
+          </div>
+        </label>
+
+        {state.safeguardEnabled && (
+          <div className="mt-4 grid grid-cols-2 gap-4 pl-7">
+            <Input
+              label="Threshold (%)"
+              numeric
+              inputMode="decimal"
+              value={state.safeguardThresholdPct}
+              onChange={(e) => update('safeguardThresholdPct', e.target.value)}
+              helper="1 – 50. Triggers when distance to liq ≤ this %"
+            />
+            <div>
+              <label className="block text-2xs uppercase tracking-wider text-text-muted mb-1">
+                Action on trigger
+              </label>
+              <select
+                className="w-full h-9 rounded-md border border-border-subtle bg-bg-base px-2 text-sm text-text-primary"
+                value={state.safeguardAction}
+                onChange={(e) =>
+                  update('safeguardAction', e.target.value as 'pause' | 'pause_close')
+                }
+              >
+                <option value="pause">Pause only (keep position)</option>
+                <option value="pause_close">Pause and close position</option>
+              </select>
+            </div>
+            <p className="col-span-2 text-2xs text-text-muted flex items-start gap-1.5">
+              <AlertTriangle className="size-3 shrink-0 mt-0.5 text-warning" />
+              <span>
+                Local estimate based on entry price and leverage. Leave a
+                buffer — the real liquidation price may differ.
+              </span>
+            </p>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

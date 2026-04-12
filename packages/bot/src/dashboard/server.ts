@@ -1309,20 +1309,13 @@ process.on('SIGINT', async () => {
 
 process.on('SIGTERM', async () => {
   console.log('🛑 SIGTERM received, shutting down gracefully (keeping orders on GRVT)...');
-  // DO NOT call gridEngine.stop() - it cancels all orders!
-  // Just stop intervals and close DB via gracefulShutdown
-  (gridEngine as any).isRunning = false;
-  if ((gridEngine as any).monitoringInterval) {
-    clearInterval((gridEngine as any).monitoringInterval);
-    (gridEngine as any).monitoringInterval = null;
-  }
-  if ((gridEngine as any).fundingPollingInterval) {
-    clearInterval((gridEngine as any).fundingPollingInterval);
-    (gridEngine as any).fundingPollingInterval = null;
-  }
-  if ((gridEngine as any).dailySnapshotInterval) {
-    clearInterval((gridEngine as any).dailySnapshotInterval);
-    (gridEngine as any).dailySnapshotInterval = null;
+  // C.5: stop({ preserveOrders: true }) clears every interval, drains
+  // in-flight poll tasks (fill archive, funding, compound), and skips
+  // the bot-pause step so GRVT orders survive a container restart.
+  try {
+    await gridEngine.stop({ preserveOrders: true });
+  } catch (stopErr) {
+    console.error('❌ Error stopping engine during SIGTERM:', stopErr);
   }
   await db.close();
   console.log('✅ Shutdown limpio — órdenes preservadas en GRVT');

@@ -204,6 +204,13 @@ export class GRVTClient {
     }
   }
 
+  /** Public accessor for the sub-account id this client authenticates
+   *  as. Callers that build createOrder() payloads need it to populate
+   *  the sub_account_id field correctly for multi-tenant bots. */
+  get subAccountId(): string {
+    return this.tradingAccountId;
+  }
+
   /** Login to GRVT using this client's API key. Only needed when
    *  using explicit creds — the legacy path re-auths inside
    *  authenticatedRequest(). */

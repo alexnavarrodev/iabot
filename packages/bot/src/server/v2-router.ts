@@ -20,6 +20,8 @@ import type { GridBotDB } from '../database/db.js';
 import { hashPassword, verifyPassword } from '../auth/passwords.js';
 import { signToken, verifyToken } from '../auth/jwt.js';
 import { encryptCredentialFields } from '../auth/crypto.js';
+import { GRVTClient, type GrvtClientCreds } from '../api/client.js';
+import { invalidateGrvtClient } from '../api/grvt-client-factory.js';
 
 // Augment Express Request to carry the authenticated user id set
 // by the JWT middleware. Every protected handler reads req.userId.
@@ -72,6 +74,11 @@ interface EngineOps {
     lowerPrice: number,
     upperPrice: number
   ): Promise<unknown>;
+  // C.3: invalidate the cached per-user GRVT client + refresh the
+  // injected client on every running bot owned by this user. Called
+  // after the user rotates their credentials so live bots pick up
+  // the new keys without a restart.
+  rebindGrvtClient?(userId: number): Promise<void>;
 }
 
 export interface V2RouterDeps {
@@ -348,10 +355,14 @@ export function createV2Router(deps: V2RouterDeps): Router {
 
   // ── POST /api/v2/auth/grvt-credentials ─────────────────────────
   // Save (or update) the user's GRVT credentials. Encrypts each
-  // field with AES-256-GCM before persisting. Does NOT test the
-  // connection here — Sprint 2 will add a per-user GRVTClient
-  // factory and a real test-connection step. For now we just
-  // accept and store.
+  // field with AES-256-GCM before persisting.
+  //
+  // C.2: before saving, the credentials are verified against the real
+  // GRVT API with a transient client: login() + getBalance(). Only on
+  // success the row is written with last_test_ok=1. On failure the
+  // row is NOT saved — the user sees the exact GRVT error instead of
+  // the previous "save now, fail later with cryptic message at bot
+  // creation" flow.
   router.post('/auth/grvt-credentials', asyncHandler(async (req, res) => {
     const userId = req.userId!;
     const body = (req.body ?? {}) as {
@@ -382,6 +393,40 @@ export function createV2Router(deps: V2RouterDeps): Router {
       return res.status(400).json({ error: 'validation_failed', errors });
     }
 
+    // C.2: verify credentials against GRVT before persisting.
+    const plainCreds: GrvtClientCreds = {
+      apiKey,
+      apiSecret,
+      tradingAddress,
+      accountId,
+      subAccountId,
+    };
+    let testEquity: string | null = null;
+    try {
+      const testClient = new GRVTClient(plainCreds);
+      const loggedIn = await testClient.login();
+      if (!loggedIn) {
+        log.warn({ userId }, 'GRVT credential test: login returned false');
+        return res.status(400).json({
+          error: 'credential_test_failed',
+          stage: 'login',
+          message: 'GRVT login failed — check apiKey and apiSecret',
+        });
+      }
+      // Authenticated round-trip — validates accountId/subAccountId too.
+      const balance = await testClient.getBalance();
+      testEquity = balance.total_equity ?? null;
+      log.info({ userId, equity: testEquity }, 'GRVT credential test: ok');
+    } catch (testErr) {
+      const msg = (testErr as Error).message || 'unknown error';
+      log.warn({ userId, err: msg }, 'GRVT credential test: failed');
+      return res.status(400).json({
+        error: 'credential_test_failed',
+        stage: 'account_summary',
+        message: `GRVT API call failed: ${msg}`,
+      });
+    }
+
     try {
       const encrypted = encryptCredentialFields({
         apiKey,
@@ -393,11 +438,27 @@ export function createV2Router(deps: V2RouterDeps): Router {
       await gridBotDb.upsertGrvtCredentials({
         user_id: userId,
         ...encrypted,
-        last_test_ok: false, // Sprint 2 will set this from a real test
+        last_test_ok: true,
         last_test_error: null,
       });
-      log.info({ userId }, 'GRVT credentials saved (not yet tested)');
-      res.json({ ok: true });
+      // If the user is rotating keys, the factory cache holds a stale
+      // client bound to the old creds. Drop it so subsequent requests
+      // pick up the new ones. Also rebind the client on any running
+      // bots owned by this user so their next tick authenticates
+      // with the fresh keys instead of a stale cookie session.
+      invalidateGrvtClient(userId);
+      if (engineOps.rebindGrvtClient) {
+        try {
+          await engineOps.rebindGrvtClient(userId);
+        } catch (rebindErr) {
+          log.warn(
+            { userId, err: (rebindErr as Error).message },
+            'rebindGrvtClient failed after credential save; running bots will use stale client until next restart'
+          );
+        }
+      }
+      log.info({ userId }, 'GRVT credentials saved (tested ok)');
+      res.json({ ok: true, equity: testEquity });
     } catch (err) {
       log.error({ userId, err: (err as Error).message }, 'failed to save GRVT credentials');
       res.status(500).json({
@@ -440,7 +501,8 @@ export function createV2Router(deps: V2RouterDeps): Router {
              created_at, updated_at,
              compound_pct, compound_threshold_usdt, compound_interval_hours,
              last_compound_at, total_reinvested, original_investment_usdt,
-             quantity_per_level
+             quantity_per_level,
+             safeguard_enabled, safeguard_threshold_pct, safeguard_action
       FROM grid_bots
       WHERE COALESCE(user_id, 1) = ?
       ORDER BY created_at DESC
@@ -1270,6 +1332,9 @@ export function createV2Router(deps: V2RouterDeps): Router {
       leverage: number;
       acceptedTermsText: string;
       termsVersion: string;
+      safeguard_enabled: boolean;
+      safeguard_threshold_pct: number;
+      safeguard_action: 'pause' | 'pause_close';
     }>;
 
     const errors: string[] = [];
@@ -1292,12 +1357,48 @@ export function createV2Router(deps: V2RouterDeps): Router {
     if (!Number.isFinite(leverage) || leverage < 1 || leverage > 50) {
       errors.push('leverage must be between 1 and 50');
     }
+
+    // C.4: liquidation proximity safeguard (optional per-bot). If the user
+    // opts in, both threshold_pct and action are required. Validation is
+    // strict so downstream code can trust the persisted values.
+    const safeguardEnabled = body.safeguard_enabled === true;
+    let safeguardThresholdPct: number | null = null;
+    let safeguardAction: 'pause' | 'pause_close' | null = null;
+    if (safeguardEnabled) {
+      safeguardThresholdPct = Number(body.safeguard_threshold_pct);
+      if (!Number.isFinite(safeguardThresholdPct) || safeguardThresholdPct <= 0 || safeguardThresholdPct > 50) {
+        errors.push('safeguard_threshold_pct must be a number between 0 and 50 when safeguard_enabled=true');
+      }
+      if (body.safeguard_action !== 'pause' && body.safeguard_action !== 'pause_close') {
+        errors.push("safeguard_action must be 'pause' or 'pause_close' when safeguard_enabled=true");
+      } else {
+        safeguardAction = body.safeguard_action;
+      }
+    }
+
     if (errors.length > 0) {
       return res.status(400).json({ error: 'validation_failed', errors });
     }
 
     try {
       const userId = req.userId!;
+
+      // C.9: reject if user already has an active bot on this pair.
+      // Fill attribution breaks silently when two bots share an
+      // instrument on the same sub-account.
+      const existing = await dbGet<{ c: number }>(
+        db,
+        `SELECT COUNT(*) as c FROM grid_bots
+         WHERE COALESCE(user_id, 1) = ? AND pair = ? AND status IN ('running', 'paused')`,
+        [userId, pair]
+      );
+      if (existing && existing.c > 0) {
+        return res.status(409).json({
+          error: 'duplicate_instrument',
+          message: `You already have an active bot on ${pair}. Close or stop it before creating a new one.`,
+        });
+      }
+
       const botId = await engineOps.createBot({
         userId,
         pair,
@@ -1337,6 +1438,24 @@ export function createV2Router(deps: V2RouterDeps): Router {
       const compoundPct = Number((req.body as any)?.compound_pct);
       if (Number.isFinite(compoundPct) && compoundPct > 0 && compoundPct <= 100) {
         await dbRun(db, `UPDATE grid_bots SET compound_pct = ? WHERE id = ?`, [compoundPct, botId]);
+      }
+
+      // C.4: persist safeguard config if the user opted in. Validation
+      // already happened above, so we trust the values here.
+      if (safeguardEnabled && safeguardThresholdPct != null && safeguardAction != null) {
+        await dbRun(
+          db,
+          `UPDATE grid_bots
+             SET safeguard_enabled = 1,
+                 safeguard_threshold_pct = ?,
+                 safeguard_action = ?
+           WHERE id = ?`,
+          [safeguardThresholdPct, safeguardAction, botId]
+        );
+        log.info(
+          { botId, safeguardThresholdPct, safeguardAction },
+          'safeguard configured at bot creation'
+        );
       }
 
       cache.invalidatePrefix('bots');
@@ -1581,20 +1700,48 @@ export function createV2Router(deps: V2RouterDeps): Router {
   }));
 
   // ── GET /api/v2/health ────────────────────────────────────────────
-  // Detailed health for the dashboard. Different shape from /api/health
-  // (which is for systemd / external monitors).
+  // C.6: real health check — verifies DB read + GRVT API reachability.
+  // Returns ok / degraded / down with per-component latency. Docker
+  // HEALTHCHECK and external monitors can act on the HTTP status code
+  // (200 = ok or degraded, 503 = down).
   router.get('/health', asyncHandler(async (_req, res) => {
-    const botCount = await dbGet<{ c: number }>(db, `SELECT COUNT(*) as c FROM grid_bots WHERE status = 'running'`);
-    res.json({
-      status: 'ok',
+    const checks: Record<string, { ok: boolean; ms: number; error?: string }> = {};
+
+    // DB: lightweight SELECT
+    const dbStart = Date.now();
+    let runningBots = 0;
+    try {
+      const row = await dbGet<{ c: number }>(db, `SELECT COUNT(*) as c FROM grid_bots WHERE status = 'running'`);
+      runningBots = row?.c ?? 0;
+      checks.db = { ok: true, ms: Date.now() - dbStart };
+    } catch (err) {
+      checks.db = { ok: false, ms: Date.now() - dbStart, error: (err as Error).message };
+    }
+
+    // GRVT: public ticker (no auth needed)
+    const grvtStart = Date.now();
+    try {
+      await grvtClient.getTicker('BTC_USDT_Perp');
+      checks.grvt = { ok: true, ms: Date.now() - grvtStart };
+    } catch (err) {
+      checks.grvt = { ok: false, ms: Date.now() - grvtStart, error: (err as Error).message };
+    }
+
+    const allOk = Object.values(checks).every(c => c.ok);
+    const status = allOk ? 'ok' : checks.db?.ok ? 'degraded' : 'down';
+    const httpCode = allOk ? 200 : checks.db?.ok ? 200 : 503;
+
+    res.status(httpCode).json({
+      status,
+      checks,
       uptime: Math.floor(process.uptime()),
-      runningBots: botCount?.c ?? 0,
+      runningBots: checks.db?.ok ? runningBots : null,
       cacheSize: cache.size(),
       memory: {
         rss: Math.round(process.memoryUsage().rss / 1024 / 1024),
-        heapUsed: Math.round(process.memoryUsage().heapUsed / 1024 / 1024)
+        heapUsed: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
       },
-      ts: Date.now()
+      ts: Date.now(),
     });
     return;
   }));

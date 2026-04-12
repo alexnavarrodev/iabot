@@ -2,6 +2,7 @@
 // Lógica completa de grid trading con safeguards para dinero real
 
 import { grvtClient, type GRVTClient } from '../api/client.js';
+import { getGrvtClientForUser, invalidateGrvtClient } from '../api/grvt-client-factory.js';
 import { db } from '../database/db.js';
 import type { GridBot, GridLevel, OrderRecord } from '../database/db.js';
 import { EventEmitter } from 'events';
@@ -104,6 +105,31 @@ function computeQtyPerLevel(
   return Math.round(qty * 100) / 100;
 }
 
+// GRVT maintenance margin used by calculateLiquidationPrice() in the
+// REST client. Kept in sync here for the local per-tick estimate so we
+// don't have to fetch positions on every monitor loop. Verify per pair
+// if GRVT ever publishes per-symbol margin tiers.
+const SAFEGUARD_MAINTENANCE_MARGIN = 0.005;
+
+/**
+ * Local estimate of liquidation price for the safeguard check. Uses the
+ * bot's current avg_entry_price (updated on every fill) and leverage,
+ * so it stays accurate across the bot's lifetime without an extra GRVT
+ * API call per tick. Returns null when there is no position yet —
+ * the safeguard is a no-op in that case because there is nothing to
+ * liquidate.
+ */
+function computeLiqPriceLocal(bot: GridBot): number | null {
+  if (!bot.avg_entry_price || bot.avg_entry_price <= 0) return null;
+  const factor = 1 / bot.leverage - SAFEGUARD_MAINTENANCE_MARGIN;
+  if (factor <= 0) return null;
+  if (bot.direction === 'long') {
+    return bot.avg_entry_price * (1 - factor);
+  } else {
+    return bot.avg_entry_price * (1 + factor);
+  }
+}
+
 /**
  * Grid Trading Engine
  * Maneja la lógica completa de grid trading con safeguards
@@ -117,11 +143,47 @@ export class GridEngine extends EventEmitter {
   private fillPollingInterval: NodeJS.Timeout | null = null; // Phase B.10: Fill archive poller
   private isRunning = false;
 
+  // C.5: track every async task spawned from an interval / setTimeout
+  // so stop() can drain them before the host closes the SQLite DB.
+  // Without this, a SIGTERM during pollFillArchive would fail mid-write
+  // against a closing DB, potentially corrupting the WAL.
+  private inflightTasks = new Set<Promise<unknown>>();
+
   // Per-bot mutex set: a bot id is in this set while a long-running
   // mutation (currently: updateBotRange) is in flight. monitor() skips
   // any bot in this set so it cannot race with the mutation, place
   // duplicate orders, or read inconsistent grid_levels mid-transaction.
   private bumpInProgress = new Set<number>();
+
+  /**
+   * Register an async task started from an interval/timeout so stop()
+   * can await it. Guarded by isRunning: if the engine is shutting
+   * down we skip launching new work entirely (the interval may have
+   * fired in the same tick that clearInterval ran). Errors are logged
+   * but swallowed to avoid poisoning the set.
+   */
+  private track<T>(label: string, fn: () => Promise<T>): void {
+    if (!this.isRunning) return;
+    const task = fn().catch((err) => {
+      console.error(`❌ [${label}] in-flight task failed:`, (err as Error).message);
+    });
+    this.inflightTasks.add(task);
+    task.finally(() => this.inflightTasks.delete(task));
+  }
+
+  /**
+   * Wait for every currently-registered async task to settle. Called
+   * by stop() before returning so the outer shutdown can safely close
+   * the DB. Uses allSettled so a single failed task doesn't abort the
+   * drain.
+   */
+  private async drainInflight(label: string): Promise<void> {
+    if (this.inflightTasks.size === 0) return;
+    const pending = this.inflightTasks.size;
+    console.log(`⏳ ${label}: waiting for ${pending} in-flight task(s) to settle...`);
+    await Promise.allSettled([...this.inflightTasks]);
+    console.log(`✅ ${label}: in-flight drain complete`);
+  }
 
   isBotMutating(botId: number): boolean {
     return this.bumpInProgress.has(botId);
@@ -130,6 +192,59 @@ export class GridEngine extends EventEmitter {
   constructor() {
     super();
     console.log('🤖 Grid Engine inicializado');
+  }
+
+  /**
+   * Resolve the GRVT client that should serve this bot. Multi-tenant:
+   * if the bot has a user_id, look up that user's encrypted credentials
+   * via the factory. Fall back to the module-level singleton (env vars)
+   * for legacy bots with no user_id — this keeps bot 44 (owner) working
+   * under the legacy env-var path while new bots route to their owner.
+   *
+   * The factory has its own LRU cache, so calling this on every tick is
+   * cheap after the first resolve.
+   */
+  private async getClientForBot(
+    bot: { id?: number; user_id?: number | null | undefined }
+  ): Promise<GRVTClient> {
+    if (bot.user_id != null) {
+      try {
+        return await getGrvtClientForUser(bot.user_id, db as any);
+      } catch (err) {
+        console.warn(
+          `⚠️  Per-user GRVT client lookup failed for user ${bot.user_id} (bot ${bot.id ?? '?'}): ${(err as Error).message}. Falling back to singleton.`
+        );
+      }
+    }
+    return grvtClient;
+  }
+
+  /**
+   * Drop any cached per-user GRVT client and replace the injected
+   * reference on every running GridBotInstance owned by that user.
+   * Call this after a user rotates their credentials so the next
+   * tick uses the fresh keys instead of the stale cookie session.
+   */
+  async rebindGrvtClient(userId: number): Promise<void> {
+    invalidateGrvtClient(userId);
+    const affected: number[] = [];
+    for (const [botId, instance] of this.bots) {
+      const bot = instance.getBot();
+      if (bot.user_id === userId) {
+        try {
+          const fresh = await getGrvtClientForUser(userId, db as any);
+          instance.rebindClient(fresh);
+          affected.push(botId);
+        } catch (err) {
+          console.warn(
+            `⚠️  rebindGrvtClient: failed to refresh client for bot ${botId}: ${(err as Error).message}`
+          );
+        }
+      }
+    }
+    if (affected.length > 0) {
+      console.log(`🔄 Rebound GRVT client for user ${userId} on bots: ${affected.join(', ')}`);
+    }
   }
 
   /**
@@ -145,21 +260,28 @@ export class GridEngine extends EventEmitter {
       // Cargar bots activos de la database
       await this.loadActiveBots();
       
+      // The engine is considered "running" from this point on so the
+      // track() helper accepts the intervals about to fire. isRunning
+      // was set at the very bottom before C.5 but that created a race:
+      // if the first setTimeout below fired before the flag flipped,
+      // track() would early-return and the task wouldn't be registered.
+      this.isRunning = true;
+
       // Iniciar monitoreo cada 5 segundos
       this.monitoringInterval = setInterval(() => {
-        this.monitorAllBots().catch(console.error);
+        this.track('monitorAllBots', () => this.monitorAllBots());
       }, 5000);
 
       // ⚠️ NUEVO: Polling funding history cada 30 minutos
       this.fundingPollingInterval = setInterval(() => {
-        this.pollFundingHistory().catch(console.error);
+        this.track('pollFundingHistory', () => this.pollFundingHistory());
       }, 30 * 60 * 1000); // 30 minutos
 
       // Compound rebalance: checks every hour. Only acts on bots with
       // compound_pct > 0. Uses real grid profit (spread-paired fills),
       // bumps investment_usdt + quantity_per_level atomically.
       this.compoundCheckInterval = setInterval(() => {
-        this.checkCompoundRebalance().catch(err => console.error('Compound check error:', err));
+        this.track('checkCompoundRebalance', () => this.checkCompoundRebalance());
       }, 60 * 60 * 1000);
       console.log('🔄 Compound rebalance enabled (per-bot opt-in, checks every 1h)');
 
@@ -175,7 +297,7 @@ export class GridEngine extends EventEmitter {
 
       // ⚠️ NUEVO: Backfill inicial de funding history
       setTimeout(() => {
-        this.backfillFundingHistory().catch(console.error);
+        this.track('backfillFundingHistory', () => this.backfillFundingHistory());
       }, 5000); // Ejecutar después de 5s para que el engine esté listo
 
       // Phase B.10: Fill archive poller — pulls fill_history from GRVT
@@ -185,16 +307,12 @@ export class GridEngine extends EventEmitter {
       // in the engine — the schema existed but the writer was never
       // implemented. This loop is the writer.
       this.fillPollingInterval = setInterval(() => {
-        this.pollFillArchive().catch((err) => {
-          console.error('❌ Fill archive poller error:', err.message);
-        });
+        this.track('pollFillArchive', () => this.pollFillArchive());
       }, 30 * 1000);
       // First poll fires 8s after boot (after auth + initial monitor pass)
       setTimeout(() => {
-        this.pollFillArchive().catch(console.error);
+        this.track('pollFillArchive:initial', () => this.pollFillArchive());
       }, 8_000);
-
-      this.isRunning = true;
       console.log('✅ Grid Engine iniciado - monitoreando cada 5s, funding cada 30min, fills cada 30s, snapshots cada 24h');
       
     } catch (error) {
@@ -204,9 +322,24 @@ export class GridEngine extends EventEmitter {
   }
 
   /**
-   * Parar el engine
+   * Parar el engine.
+   *
+   * C.5: the previous implementation cleared intervals and returned
+   * immediately, leaving in-flight poll tasks (fill archive, funding,
+   * compound check) racing against the host's db.close(). On SIGTERM
+   * under real load this corrupted the SQLite WAL. Now we:
+   *
+   *   1. Flip isRunning=false so NEW work is refused by track().
+   *   2. Clear every interval so no new ticks fire.
+   *   3. Drain every in-flight task via drainInflight() — this is
+   *      the critical await the old code was missing.
+   *   4. Optionally pause bots (cancels GRVT orders). The SIGTERM
+   *      path passes preserveOrders=true so a prod container restart
+   *      leaves orders live on the exchange.
+   *
+   * Safe to call multiple times; the isRunning guard short-circuits.
    */
-  async stop(): Promise<void> {
+  async stop(options: { preserveOrders?: boolean } = {}): Promise<void> {
     if (!this.isRunning) return;
 
     this.isRunning = false;
@@ -240,12 +373,21 @@ export class GridEngine extends EventEmitter {
       this.fillPollingInterval = null;
     }
 
-    // Pausar todos los bots
-    for (const [botId, botInstance] of this.bots) {
-      await this.pauseBot(botId);
+    // C.5: drain in-flight async work before we let the caller close
+    // the DB. Without this the process dies mid-write.
+    await this.drainInflight('engine.stop');
+
+    // Pausar todos los bots — skipped when preserveOrders is set so
+    // SIGTERM restarts leave orders live on GRVT.
+    if (!options.preserveOrders) {
+      for (const [botId] of this.bots) {
+        await this.pauseBot(botId);
+      }
     }
 
-    console.log('🛑 Grid Engine detenido');
+    console.log(
+      `🛑 Grid Engine detenido${options.preserveOrders ? ' (orders preserved on GRVT)' : ''}`
+    );
   }
 
   /**
@@ -345,6 +487,12 @@ export class GridEngine extends EventEmitter {
         return;
       }
 
+      // Resolve the per-user GRVT client once, up-front. Every read /
+      // write below uses this client so a bot owned by user X never
+      // touches user Y's sub-account. Falls back to the singleton for
+      // legacy bots without user_id.
+      const client = await this.getClientForBot(bot);
+
       // ── DETECT EXISTING GRVT-SIDE STATE (FAIL LOUD) ──────────────
       // We MUST verify the live GRVT state before deciding RESUME vs
       // FRESH START. The previous version caught errors and returned
@@ -380,11 +528,11 @@ export class GridEngine extends EventEmitter {
 
       const existingOrders = await fetchWithRetry(
         'getOpenOrders',
-        () => grvtClient.getOpenOrders(bot.pair)
+        () => client.getOpenOrders(bot.pair)
       );
       const existingPosition = await fetchWithRetry(
         'getPosition',
-        () => grvtClient.getPosition(bot.pair)
+        () => client.getPosition(bot.pair)
       );
       const positionSize =
         existingPosition && (existingPosition as any).size
@@ -392,7 +540,7 @@ export class GridEngine extends EventEmitter {
           : 0;
       const hasExistingState = existingOrders.length > 0 || positionSize > 0;
 
-      const instance = new GridBotInstance(bot);
+      const instance = new GridBotInstance(bot, client);
       this.bots.set(botId, instance);
 
       if (hasExistingState) {
@@ -405,7 +553,7 @@ export class GridEngine extends EventEmitter {
         // Verificar balance antes de iniciar
         await this.validateSufficientBalance(bot);
         // Establecer leverage
-        await grvtClient.setLeverage(bot.pair, bot.leverage);
+        await client.setLeverage(bot.pair, bot.leverage);
         // Colocar órdenes iniciales
         await instance.placeInitialOrders();
       }
@@ -495,12 +643,18 @@ export class GridEngine extends EventEmitter {
       const bot = await db.getBot(botId);
       if (!bot) throw new Error(`Bot ${botId} no encontrado`);
 
+      // Multi-tenant: route every GRVT call through the bot owner's
+      // client. Must be resolved BEFORE pauseBot() because pauseBot
+      // removes the instance from the map, which is where the client
+      // is cached — after that we'd have to re-resolve anyway.
+      const client = await this.getClientForBot(bot);
+
       // Pausar primero
       await this.pauseBot(botId);
 
       // ⚠️ CRÍTICO: Consultar posición real de GRVT, NO usar DB
       console.log('📊 Consultando posición real en GRVT...');
-      const positions = await grvtClient.getPositions();
+      const positions = await client.getPositions();
       const position = positions.find(p => p.instrument === bot.pair);
       const realPositionSize = position ? parseFloat(position.size) : 0;
 
@@ -512,17 +666,19 @@ export class GridEngine extends EventEmitter {
         const closeSize = Math.abs(realPositionSize);
 
         console.log(`🔄 Cerrando posición: ${closeSide} ${closeSize} ${bot.pair}`);
-        
+
         // Precio agresivo (0.5% peor que market) con GTC para garantizar fill
-        const ticker = await grvtClient.getTicker(bot.pair);
+        const ticker = await client.getTicker(bot.pair);
         const currentPrice = parseFloat(ticker.last_price);
-        const aggressivePrice = closeSide === 'sell' 
+        const aggressivePrice = closeSide === 'sell'
           ? Math.floor(currentPrice * 0.995 * 100) / 100   // 0.5% abajo para sell
           : Math.floor(currentPrice * 1.005 * 100) / 100;  // 0.5% arriba para buy
-        
-        // ⚠️ CRÍTICO: time_in_force debe matchear la firma EIP-712 (GTC = 1)
-        await grvtClient.createOrder({
-          sub_account_id: process.env.GRVT_TRADING_ACCOUNT_ID!,
+
+        // ⚠️ CRÍTICO: time_in_force debe matchear la firma EIP-712 (GTC = 1).
+        // sub_account_id must match the client's own sub-account so
+        // multi-tenant orders land on the right wallet.
+        await client.createOrder({
+          sub_account_id: client.subAccountId,
           instrument: bot.pair,
           size: (Math.floor(closeSize * 100) / 100).toString(),
           price: aggressivePrice.toString(),
@@ -556,10 +712,13 @@ export class GridEngine extends EventEmitter {
       try {
         console.log(`🔧 [DEBUG] Cargando bot ${bot.id} - ${bot.pair} (status: ${bot.status})`);
 
-        const instance = new GridBotInstance(bot);
+        // Inject the bot owner's GRVT client so this instance uses
+        // the correct per-user auth on every tick (multi-tenant).
+        const client = await this.getClientForBot(bot);
+        const instance = new GridBotInstance(bot, client);
         this.bots.set(bot.id, instance);
 
-        const openOrders = await grvtClient.getOpenOrders(bot.pair);
+        const openOrders = await client.getOpenOrders(bot.pair);
         console.log(`📥 Bot ${bot.id}: ${openOrders.length} órdenes abiertas en GRVT`);
 
         // Shared resume logic with startBot()'s RESUME path.
@@ -596,11 +755,26 @@ export class GridEngine extends EventEmitter {
       } catch (error) {
         console.error(`❌ Error monitoreando bot ${botId}:`, error);
 
-        // Si hay errores críticos, pausar el bot
+        // Si hay errores críticos, pausar el bot (o pausar + cerrar según la acción).
+        // Message format: SAFEGUARD:<action>:bot=N:dist=X%:liq=Y:mark=Z
         if (error instanceof Error && error.message.includes('SAFEGUARD')) {
-          console.log(`🚨 SAFEGUARD activado para bot ${botId} - pausando`);
-          await this.pauseBot(botId);
-          this.emit('safeguardTriggered', { botId, error: error.message });
+          const action = error.message.match(/SAFEGUARD:(\w+):/)?.[1] ?? 'pause';
+          console.log(`🚨 SAFEGUARD activado para bot ${botId} — acción: ${action}`);
+          try {
+            if (action === 'pause_close') {
+              await this.closeBot(botId);
+            } else {
+              await this.pauseBot(botId);
+            }
+          } catch (pauseErr) {
+            console.error(`❌ Error ejecutando acción safeguard ${action} para bot ${botId}:`, pauseErr);
+          }
+          this.emit('safeguardTriggered', {
+            botId,
+            action,
+            reason: error.message,
+            error: error.message, // legacy field preserved for existing WS consumers
+          });
         }
       }
     }
@@ -611,8 +785,11 @@ export class GridEngine extends EventEmitter {
    * ⚠️ ACTUALIZADO: debe generar exactamente numGrids+1 niveles (ej: 130 grids = 131 niveles)
    */
   async calculateGridLevels(config: GridConfig): Promise<GridCalculation> {
+    // Multi-tenant: route ticker + liq-price lookups through the
+    // owner's GRVT client so grid previews don't leak between users.
+    const client = await this.getClientForBot({ user_id: config.userId });
     // Obtener precio actual
-    const ticker = await grvtClient.getTicker(config.pair);
+    const ticker = await client.getTicker(config.pair);
     const currentPrice = parseFloat(ticker.last_price);
 
     // Validar que el precio actual esté dentro del rango
@@ -692,7 +869,7 @@ export class GridEngine extends EventEmitter {
     // Calcular liquidation price aproximado (non-fatal si falla)
     let liquidationPrice = 0;
     try {
-      liquidationPrice = parseFloat(await grvtClient.calculateLiquidationPrice(config.pair, config.leverage));
+      liquidationPrice = parseFloat(await client.calculateLiquidationPrice(config.pair, config.leverage));
     } catch (e) {
       console.log(`⚠️ No se pudo calcular liquidation price: ${(e as Error).message}`);
       // Estimación simple: entry / leverage para long
@@ -762,7 +939,8 @@ export class GridEngine extends EventEmitter {
    * Validar balance suficiente
    */
   private async validateSufficientBalance(bot: GridBot): Promise<void> {
-    const balance = await grvtClient.getBalance();
+    const client = await this.getClientForBot(bot);
+    const balance = await client.getBalance();
     const availableBalance = parseFloat(balance.available_balance);
     
     const requiredMargin = bot.investment_usdt / bot.leverage;
@@ -812,66 +990,64 @@ export class GridEngine extends EventEmitter {
   private async pollFundingHistory(): Promise<void> {
     try {
       console.log(`💰 [DEBUG] Polling funding history...`);
-      
+
       const activeBots = await db.getBotsByStatus('running');
       if (activeBots.length === 0) {
         console.log(`💰 [DEBUG] No hay bots activos, skipping funding poll`);
         return;
       }
 
-      // Obtener funding history para cada instrumento único
-      const instruments = [...new Set(activeBots.map(bot => bot.pair))];
-      
-      for (const instrument of instruments) {
+      // Multi-tenant: funding payments are per sub-account, so each bot
+      // needs its OWN poll against its OWNER's GRVT client. Two users
+      // with ETH bots have disjoint funding streams, so the old
+      // instrument-keyed loop would attribute user A's funding to
+      // user B's bot.
+      for (const bot of activeBots) {
         try {
-          console.log(`💰 [DEBUG] Polling funding para ${instrument}...`);
-          
-          const fundingPayments = await grvtClient.getFundingHistory(50, instrument);
-          console.log(`💰 [DEBUG] Recibidos ${fundingPayments.length} funding payments para ${instrument}`);
-          
+          console.log(`💰 [DEBUG] Polling funding para bot ${bot.id} (${bot.pair})...`);
+
+          const client = await this.getClientForBot(bot);
+          const fundingPayments = await client.getFundingHistory(50, bot.pair);
+          console.log(`💰 [DEBUG] Bot ${bot.id}: ${fundingPayments.length} funding payments`);
+
           // Obtener último funding time registrado para evitar duplicados
-          const existingFunding = await db.getFundingHistoryByBot(activeBots[0]!.id);
-          const lastFundingTime = existingFunding.length > 0 ? 
+          const existingFunding = await db.getFundingHistoryByBot(bot.id);
+          const lastFundingTime = existingFunding.length > 0 ?
             new Date(existingFunding[0]!.funding_time).getTime() : 0;
 
           // Filtrar nuevos payments
-          const newPayments = fundingPayments.filter(payment => 
+          const newPayments = fundingPayments.filter(payment =>
             payment.funding_time * 1000 > lastFundingTime
           );
 
-          console.log(`💰 [DEBUG] ${newPayments.length} nuevos funding payments para ${instrument}`);
+          console.log(`💰 [DEBUG] Bot ${bot.id}: ${newPayments.length} nuevos funding payments`);
 
-          // Registrar nuevos payments para cada bot del instrumento
-          const botsForInstrument = activeBots.filter(bot => bot.pair === instrument);
-          
           for (const payment of newPayments) {
-            for (const bot of botsForInstrument) {
-              try {
-                // Convertir payment de raw a USDT (÷ 1e6)
-                const paymentUsdt = parseFloat(payment.payment) / 1e6;
-                
-                await db.createFundingRecord({
-                  bot_id: bot.id,
-                  instrument: instrument,
-                  funding_rate: parseFloat(payment.funding_rate),
-                  payment_usdt: paymentUsdt,
-                  position_size: parseFloat(payment.position_size),
-                  funding_time: new Date(payment.funding_time * 1000).toISOString()
-                });
-                
-                console.log(`💰 [DEBUG] Funding registrado para bot ${bot.id}: ${paymentUsdt.toFixed(4)} USDT`);
-                
-              } catch (fundingErr) {
-                console.error(`❌ Error registrando funding para bot ${bot.id}:`, fundingErr);
-              }
+            try {
+              // Convertir payment de raw a USDT (÷ 1e6)
+              const paymentUsdt = parseFloat(payment.payment) / 1e6;
+
+              await db.createFundingRecord({
+                bot_id: bot.id,
+                instrument: bot.pair,
+                funding_rate: parseFloat(payment.funding_rate),
+                payment_usdt: paymentUsdt,
+                position_size: parseFloat(payment.position_size),
+                funding_time: new Date(payment.funding_time * 1000).toISOString()
+              });
+
+              console.log(`💰 [DEBUG] Funding registrado para bot ${bot.id}: ${paymentUsdt.toFixed(4)} USDT`);
+
+            } catch (fundingErr) {
+              console.error(`❌ Error registrando funding para bot ${bot.id}:`, fundingErr);
             }
           }
 
-          // Throttle entre instrumentos
+          // Throttle between bots
           await new Promise(r => setTimeout(r, 1000));
 
-        } catch (instrumentErr) {
-          console.error(`❌ Error polling funding para ${instrument}:`, instrumentErr);
+        } catch (botErr) {
+          console.error(`❌ Error polling funding para bot ${bot.id}:`, botErr);
         }
       }
 
@@ -888,73 +1064,66 @@ export class GridEngine extends EventEmitter {
   private async backfillFundingHistory(): Promise<void> {
     try {
       console.log(`🔄 [DEBUG] Iniciando backfill de funding history...`);
-      
+
       const allBots = await db.getAllBots();
       if (allBots.length === 0) {
         console.log(`🔄 [DEBUG] No hay bots, skipping backfill`);
         return;
       }
 
-      // Obtener instrumentos únicos
-      const instruments = [...new Set(allBots.map(bot => bot.pair))];
-      
-      for (const instrument of instruments) {
+      // Multi-tenant: one backfill per bot, using the owner's client.
+      for (const bot of allBots) {
         try {
-          console.log(`🔄 [DEBUG] Backfill funding para ${instrument}...`);
-          
+          console.log(`🔄 [DEBUG] Backfill funding para bot ${bot.id} (${bot.pair})...`);
+
+          const client = await this.getClientForBot(bot);
           // Obtener todo el funding history disponible (últimos 500)
-          const allFunding = await grvtClient.getFundingHistory(500, instrument);
-          console.log(`🔄 [DEBUG] Total funding history disponible: ${allFunding.length}`);
-          
-          // Obtener bots para este instrumento
-          const botsForInstrument = allBots.filter(bot => bot.pair === instrument);
-          
-          // Para cada bot, registrar funding history desde su fecha de creación
-          for (const bot of botsForInstrument) {
-            const botCreatedTime = new Date(bot.created_at).getTime();
-            
-            // Filtrar funding después de la creación del bot
-            const relevantFunding = allFunding.filter(payment => 
-              payment.funding_time * 1000 >= botCreatedTime
-            );
+          const allFunding = await client.getFundingHistory(500, bot.pair);
+          console.log(`🔄 [DEBUG] Bot ${bot.id}: total funding history disponible: ${allFunding.length}`);
 
-            console.log(`🔄 [DEBUG] Bot ${bot.id}: ${relevantFunding.length} funding payments relevantes`);
+          const botCreatedTime = new Date(bot.created_at).getTime();
 
-            for (const payment of relevantFunding) {
-              try {
-                // Verificar si ya existe este funding
-                const existing = await db.getFundingHistoryByBot(bot.id);
-                const fundingTimeStr = new Date(payment.funding_time * 1000).toISOString();
-                
-                if (existing.some(f => f.funding_time === fundingTimeStr)) {
-                  continue; // Ya existe, skip
-                }
+          // Filtrar funding después de la creación del bot
+          const relevantFunding = allFunding.filter(payment =>
+            payment.funding_time * 1000 >= botCreatedTime
+          );
 
-                // Convertir payment de raw a USDT (÷ 1e6)
-                const paymentUsdt = parseFloat(payment.payment) / 1e6;
-                
-                await db.createFundingRecord({
-                  bot_id: bot.id,
-                  instrument: instrument,
-                  funding_rate: parseFloat(payment.funding_rate),
-                  payment_usdt: paymentUsdt,
-                  position_size: parseFloat(payment.position_size),
-                  funding_time: fundingTimeStr
-                });
+          console.log(`🔄 [DEBUG] Bot ${bot.id}: ${relevantFunding.length} funding payments relevantes`);
 
-              } catch (recordErr) {
-                console.error(`❌ Error registrando funding record:`, recordErr);
+          for (const payment of relevantFunding) {
+            try {
+              // Verificar si ya existe este funding
+              const existing = await db.getFundingHistoryByBot(bot.id);
+              const fundingTimeStr = new Date(payment.funding_time * 1000).toISOString();
+
+              if (existing.some(f => f.funding_time === fundingTimeStr)) {
+                continue; // Ya existe, skip
               }
-            }
 
-            console.log(`🔄 [DEBUG] Backfill completado para bot ${bot.id}`);
+              // Convertir payment de raw a USDT (÷ 1e6)
+              const paymentUsdt = parseFloat(payment.payment) / 1e6;
+
+              await db.createFundingRecord({
+                bot_id: bot.id,
+                instrument: bot.pair,
+                funding_rate: parseFloat(payment.funding_rate),
+                payment_usdt: paymentUsdt,
+                position_size: parseFloat(payment.position_size),
+                funding_time: fundingTimeStr
+              });
+
+            } catch (recordErr) {
+              console.error(`❌ Error registrando funding record:`, recordErr);
+            }
           }
 
-          // Throttle entre instrumentos
+          console.log(`🔄 [DEBUG] Backfill completado para bot ${bot.id}`);
+
+          // Throttle between bots
           await new Promise(r => setTimeout(r, 2000));
 
-        } catch (instrumentErr) {
-          console.error(`❌ Error backfill funding para ${instrument}:`, instrumentErr);
+        } catch (botErr) {
+          console.error(`❌ Error backfill funding para bot ${bot.id}:`, botErr);
         }
       }
 
@@ -1124,7 +1293,8 @@ export class GridEngine extends EventEmitter {
       throw new Error(`Bot ${botId} not found`);
     }
 
-    const ticker = await grvtClient.getTicker(bot.pair);
+    const client = await this.getClientForBot(bot);
+    const ticker = await client.getTicker(bot.pair);
     const currentPrice = parseFloat(ticker.last_price);
     if (!Number.isFinite(currentPrice) || currentPrice <= 0) {
       throw new Error(`Bot ${botId}: invalid ticker price`);
@@ -1194,10 +1364,12 @@ export class GridEngine extends EventEmitter {
     // deficit BEFORE the sells go in or they'd take us short.
     const ethNeeded = sellLevelsCount * canonicalQty;
 
-    // Live position from GRVT.
+    // Live position from GRVT — resolved via the per-bot client. The
+    // `client` was set earlier in buildRangeUpdatePlan() when we read
+    // the ticker.
     let currentPosition = 0;
     try {
-      const position = await grvtClient.getPosition(bot.pair);
+      const position = await client.getPosition(bot.pair);
       if (position) currentPosition = parseFloat(position.size);
     } catch (posErr) {
       safetyViolations.push(
@@ -1295,6 +1467,10 @@ export class GridEngine extends EventEmitter {
     const bot = await db.getBot(plan.botId);
     if (!bot) throw new Error(`Bot ${plan.botId} not found at apply time`);
 
+    // Multi-tenant: use the bot owner's client for all GRVT calls below
+    // so range updates on user A's bot never touch user B's sub-account.
+    const client = await this.getClientForBot(bot);
+
     console.log(
       `🔄 Updating range for bot ${plan.botId}: $${plan.currentRange.lower}-$${plan.currentRange.upper} → $${plan.newRange.lower}-$${plan.newRange.upper}`
     );
@@ -1304,16 +1480,13 @@ export class GridEngine extends EventEmitter {
 
     // Step 1: ETH auto-purchase
     if (plan.autoBuy) {
-      const sub = process.env.GRVT_TRADING_ACCOUNT_ID;
-      if (!sub) throw new Error('GRVT_TRADING_ACCOUNT_ID env var missing');
-
       console.log(
         `💰 Market-buying ${plan.autoBuy.size.toFixed(4)} ETH at ~$${plan.autoBuy.estimatedPrice} (deficit fill)`
       );
 
-      const buyOrder = await grvtClient.createOrder(
+      const buyOrder = await client.createOrder(
         {
-          sub_account_id: sub,
+          sub_account_id: client.subAccountId,
           instrument: bot.pair,
           size: (Math.ceil(plan.autoBuy.size * 10000) / 10000).toString(),
           price: plan.autoBuy.estimatedPrice.toString(),
@@ -1330,7 +1503,7 @@ export class GridEngine extends EventEmitter {
       await new Promise((r) => setTimeout(r, 2000));
       let postPosition = plan.currentPosition;
       try {
-        const updatedPos = await grvtClient.getPosition(bot.pair);
+        const updatedPos = await client.getPosition(bot.pair);
         if (updatedPos) postPosition = parseFloat(updatedPos.size);
       } catch (e) {
         console.log(
@@ -1359,7 +1532,7 @@ export class GridEngine extends EventEmitter {
           )
           .map((l) => ({ order_id: l.order_id!, price: l.price }))) {
       try {
-        await grvtClient.cancelOrder(orderRef.order_id, bot.pair);
+        await client.cancelOrder(orderRef.order_id, bot.pair);
         console.log(`🗑️ Cancelled order ${orderRef.order_id} @ $${orderRef.price}`);
       } catch (cancelErr) {
         console.log(
@@ -1438,28 +1611,23 @@ export class GridEngine extends EventEmitter {
   private async pollFillArchive(): Promise<void> {
     if (this.bots.size === 0) return;
 
-    // Build instrument → bot lookup so each fill can be attributed.
-    // v0 constraint: one running bot per instrument per sub-account.
-    // If two running bots share an instrument the lookup picks the
-    // first; that case is unsupported for now and would need order_id
-    // tracking to disambiguate.
-    const instrumentToBot = new Map<string, { id: number; pair: string }>();
-    for (const [botId, instance] of this.bots) {
-      const pair = instance.getPair();
-      if (pair && !instrumentToBot.has(pair)) {
-        instrumentToBot.set(pair, { id: botId, pair });
-      }
-    }
-
-    // Fetch one batch per distinct instrument so we don't miss fills
-    // for non-default pairs. For a single bot this is one call.
+    // Multi-tenant: fills are per sub-account, so we must poll each
+    // running bot's instrument through ITS OWNER's client. A single
+    // user with one bot = one call. Several users with bots on the
+    // same pair = several calls (one per user). v0 constraint: one
+    // running bot per (user, instrument) pair.
     const counts = new Map<string, { added: number; feeSum: number }>();
-    for (const [instrument, botRef] of instrumentToBot) {
+    for (const [botId, instance] of this.bots) {
+      const bot = instance.getBot();
+      const instrument = bot.pair;
+      if (!instrument) continue;
+
+      const client = await this.getClientForBot(bot);
       let allFills: any[];
       try {
-        allFills = await grvtClient.getFillHistory(1000, instrument);
+        allFills = await client.getFillHistory(1000, instrument);
       } catch (err) {
-        console.warn(`⚠️ Fill poller [${instrument}]: getFillHistory failed: ${(err as Error).message}`);
+        console.warn(`⚠️ Fill poller [bot ${botId} ${instrument}]: getFillHistory failed: ${(err as Error).message}`);
         continue;
       }
       if (!Array.isArray(allFills) || allFills.length === 0) continue;
@@ -1478,7 +1646,7 @@ export class GridEngine extends EventEmitter {
           size: parseFloat(f.size ?? '0'),
           fee,
           created_at: new Date(Number(eventTime) / 1_000_000).toISOString(),
-          bot_id: botRef.id,
+          bot_id: botId,
           instrument,
         });
         if (inserted) {
@@ -1486,12 +1654,12 @@ export class GridEngine extends EventEmitter {
           feeSum += fee;
         }
       }
-      if (added > 0) counts.set(instrument, { added, feeSum });
+      if (added > 0) counts.set(`bot ${botId} ${instrument}`, { added, feeSum });
     }
 
-    for (const [instrument, c] of counts) {
+    for (const [label, c] of counts) {
       console.log(
-        `📥 Fill archive [${instrument}]: +${c.added} new (fee sum ${c.feeSum.toFixed(6)} USDT, ${c.feeSum < 0 ? 'rebate earned' : 'fees paid'})`
+        `📥 Fill archive [${label}]: +${c.added} new (fee sum ${c.feeSum.toFixed(6)} USDT, ${c.feeSum < 0 ? 'rebate earned' : 'fees paid'})`
       );
     }
   }
@@ -1505,10 +1673,10 @@ export class GridBotInstance {
   private gridLevels: GridLevel[] = [];
   private activeOrders = new Map<string, OrderRecord>();
   private processedFills = new Set<string>(); // ⚠️ NUEVO: Deduplicación de fills
-  // Multi-tenant: per-user GRVT client. If null, falls back to the
-  // module-level `grvtClient` singleton (legacy single-tenant path).
-  // This lets bot 44 (owner) keep running on the singleton while new
-  // bots created by other users get their own client via the factory.
+  // Multi-tenant: per-user GRVT client resolved by GridEngine via
+  // getClientForBot(). Falls back to the module-level `grvtClient`
+  // singleton only for legacy bots with no user_id (the factory
+  // couldn't resolve a per-user client).
   private injectedClient: GRVTClient | null = null;
 
   constructor(bot: GridBot, client?: GRVTClient) {
@@ -1536,6 +1704,12 @@ export class GridBotInstance {
 
   getBotId(): number {
     return this.bot.id;
+  }
+
+  /** Snapshot accessor used by GridEngine.rebindGrvtClient() to filter
+   *  running instances by owner without breaking encapsulation. */
+  getBot(): GridBot {
+    return this.bot;
   }
 
   /** Replace the in-memory bot snapshot. Used by updateBotRange after
@@ -1981,7 +2155,27 @@ export class GridBotInstance {
     // 2. Get current price from the last ticker
     const ticker = await this.grvt.getTicker(this.bot.pair);
     const currentPrice = parseFloat(ticker.last_price);
-    
+
+    // 2.5. SAFEGUARD: liquidation proximity check (C.4). Opt-in per bot.
+    // Throws a SAFEGUARD:<action>: error that monitorAllBots() parses to
+    // decide whether to pause or pause+close. No-op when the bot has no
+    // position yet (avg_entry_price = 0) or the safeguard is disabled.
+    if (this.bot.safeguard_enabled) {
+      const liq = computeLiqPriceLocal(this.bot);
+      if (liq !== null && liq > 0) {
+        const distancePct = this.bot.direction === 'long'
+          ? ((currentPrice - liq) / currentPrice) * 100
+          : ((liq - currentPrice) / currentPrice) * 100;
+        const threshold = this.bot.safeguard_threshold_pct ?? 10;
+        if (distancePct <= threshold) {
+          const action = this.bot.safeguard_action ?? 'pause';
+          throw new Error(
+            `SAFEGUARD:${action}:bot=${this.bot.id}:dist=${distancePct.toFixed(2)}%:liq=${liq.toFixed(2)}:mark=${currentPrice.toFixed(2)}`
+          );
+        }
+      }
+    }
+
     // 3. Build set of GRVT prices (rounded) for coverage check
     const grvtPriceSet = new Set<number>();
     const grvtOrderMap = new Map<number, any>(); // price → {order_id, side}
@@ -2186,7 +2380,10 @@ export class GridBotInstance {
     
     // Marcar como procesado INMEDIATAMENTE
     this.processedFills.add(fillKey);
-    
+    if (this.processedFills.size > 200) {
+      [...this.processedFills].slice(0, 100).forEach(e => this.processedFills.delete(e));
+    }
+
     // ⚠️ PRIMERO: remover de activeOrders para no re-detectar
     this.activeOrders.delete(orderId);
     
