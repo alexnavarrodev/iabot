@@ -122,7 +122,7 @@ const SAFEGUARD_MAINTENANCE_MARGIN = 0.005;
  * the safeguard is a no-op in that case because there is nothing to
  * liquidate.
  */
-function computeLiqPriceLocal(bot: GridBot): number | null {
+export function computeLiqPriceLocal(bot: GridBot): number | null {
   if (!bot.avg_entry_price || bot.avg_entry_price <= 0) return null;
   const factor = 1 / bot.leverage - SAFEGUARD_MAINTENANCE_MARGIN;
   if (factor <= 0) return null;

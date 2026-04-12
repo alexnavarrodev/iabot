@@ -1,107 +1,78 @@
-// Server Tests
-// Tests for SIGTERM handler and graceful shutdown
+// Server Tests — graceful shutdown (updated for C.5)
+//
+// C.5 replaced the inline clearInterval SIGTERM hack with a clean
+// gridEngine.stop({ preserveOrders: true }) call. These tests verify
+// the shutdown contract rather than the internals.
 
-import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-// Mock GridEngine
 const mockGridEngine = {
-  isRunning: true,
-  monitoringInterval: null as NodeJS.Timeout | null,
-  fundingPollingInterval: null as NodeJS.Timeout | null,
-  stop: vi.fn()
+  stop: vi.fn().mockResolvedValue(undefined),
 };
 
-// Mock Database
 const mockDb = {
-  close: vi.fn()
+  close: vi.fn().mockResolvedValue(undefined),
 };
 
-// Mock process.exit to prevent it from actually exiting
 const mockExit = vi.spyOn(process, 'exit').mockImplementation((() => {}) as any);
 
-// We'll need to mock the actual server file imports
-vi.mock('../src/bot/grid-engine.js', () => ({
-  GridEngine: vi.fn(() => mockGridEngine)
-}));
-
-vi.mock('../src/database/db.js', () => ({
-  db: mockDb
-}));
-
-describe('Server SIGTERM Handler', () => {
-  let clearIntervalSpy: any;
-
+describe('Graceful shutdown', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-
-    // Mock console to avoid test pollution
     vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
-
-    // Spy on clearInterval
-    clearIntervalSpy = vi.spyOn(global, 'clearInterval');
-
-    // Reset mock states
-    mockGridEngine.isRunning = true;
-    mockGridEngine.monitoringInterval = setTimeout(() => {}, 1000) as any;
-    mockGridEngine.fundingPollingInterval = setTimeout(() => {}, 1000) as any;
+    mockGridEngine.stop.mockResolvedValue(undefined);
     mockDb.close.mockResolvedValue(undefined);
   });
 
-  afterEach(() => {
-    // Clean up any intervals that were created
-    if (mockGridEngine.monitoringInterval) {
-      clearInterval(mockGridEngine.monitoringInterval);
-    }
-    if (mockGridEngine.fundingPollingInterval) {
-      clearInterval(mockGridEngine.fundingPollingInterval);
-    }
-  });
+  // ── SIGTERM (production restart — preserve orders) ─────────────────
 
-  it('should handle SIGTERM without canceling GRVT orders', async () => {
+  it('SIGTERM calls stop({ preserveOrders: true }) then db.close()', async () => {
+    // Simulate the handler from dashboard/server.ts
     const sigtermHandler = async () => {
-      console.log('SIGTERM received, shutting down gracefully (keeping orders on GRVT)...');
-
-      // DO NOT call gridEngine.stop() - it cancels all orders!
-      mockGridEngine.isRunning = false;
-
-      if (mockGridEngine.monitoringInterval) {
-        clearInterval(mockGridEngine.monitoringInterval);
-        mockGridEngine.monitoringInterval = null;
+      try {
+        await mockGridEngine.stop({ preserveOrders: true });
+      } catch (err) {
+        console.error('Error stopping engine:', err);
       }
-
-      if (mockGridEngine.fundingPollingInterval) {
-        clearInterval(mockGridEngine.fundingPollingInterval);
-        mockGridEngine.fundingPollingInterval = null;
-      }
-
       await mockDb.close();
-      console.log('Graceful shutdown complete (orders preserved on GRVT)');
       process.exit(0);
     };
 
     await sigtermHandler();
 
-    expect(mockGridEngine.isRunning).toBe(false);
-    expect(mockGridEngine.monitoringInterval).toBeNull();
-    expect(mockGridEngine.fundingPollingInterval).toBeNull();
-    expect(clearIntervalSpy).toHaveBeenCalledTimes(2);
+    expect(mockGridEngine.stop).toHaveBeenCalledOnce();
+    expect(mockGridEngine.stop).toHaveBeenCalledWith({ preserveOrders: true });
     expect(mockDb.close).toHaveBeenCalledOnce();
-
-    // Most importantly: gridEngine.stop() should NOT be called
-    expect(mockGridEngine.stop).not.toHaveBeenCalled();
-
     expect(mockExit).toHaveBeenCalledWith(0);
   });
 
-  it('should handle SIGINT differently (with order cancellation)', async () => {
-    const sigintHandler = async () => {
-      console.log('\nDashboard shutting down...');
+  it('SIGTERM still closes DB even if engine.stop fails', async () => {
+    mockGridEngine.stop.mockRejectedValue(new Error('stop failed'));
 
+    const sigtermHandler = async () => {
       try {
-        await mockGridEngine.stop(); // This cancels orders
+        await mockGridEngine.stop({ preserveOrders: true });
+      } catch (err) {
+        console.error('Error stopping engine:', err);
+      }
+      await mockDb.close();
+      process.exit(0);
+    };
+
+    await sigtermHandler();
+
+    expect(mockDb.close).toHaveBeenCalledOnce();
+    expect(mockExit).toHaveBeenCalledWith(0);
+  });
+
+  // ── SIGINT (dev Ctrl+C — cancel orders) ────────────────────────────
+
+  it('SIGINT calls stop() without preserveOrders then db.close()', async () => {
+    const sigintHandler = async () => {
+      try {
+        await mockGridEngine.stop();
         await mockDb.close();
-        console.log('Graceful shutdown complete');
         process.exit(0);
       } catch (error) {
         console.error('Error during shutdown:', error);
@@ -112,95 +83,49 @@ describe('Server SIGTERM Handler', () => {
     await sigintHandler();
 
     expect(mockGridEngine.stop).toHaveBeenCalledOnce();
+    expect(mockGridEngine.stop).toHaveBeenCalledWith(); // no args = orders cancelled
     expect(mockDb.close).toHaveBeenCalledOnce();
     expect(mockExit).toHaveBeenCalledWith(0);
   });
 
-  it('should handle database close errors during SIGTERM', async () => {
-    const dbError = new Error('Database close failed');
-    mockDb.close.mockRejectedValue(dbError);
+  it('SIGINT exits 1 on error', async () => {
+    mockGridEngine.stop.mockRejectedValue(new Error('boom'));
 
-    const sigtermHandler = async () => {
+    const sigintHandler = async () => {
       try {
-        console.log('SIGTERM received, shutting down gracefully (keeping orders on GRVT)...');
-
-        mockGridEngine.isRunning = false;
-
-        if (mockGridEngine.monitoringInterval) {
-          clearInterval(mockGridEngine.monitoringInterval);
-          mockGridEngine.monitoringInterval = null;
-        }
-
-        if (mockGridEngine.fundingPollingInterval) {
-          clearInterval(mockGridEngine.fundingPollingInterval);
-          mockGridEngine.fundingPollingInterval = null;
-        }
-
+        await mockGridEngine.stop();
         await mockDb.close();
-        console.log('Graceful shutdown complete (orders preserved on GRVT)');
         process.exit(0);
       } catch (error) {
-        console.error('Error during SIGTERM shutdown:', error);
+        console.error('Error during shutdown:', error);
         process.exit(1);
       }
     };
 
-    await sigtermHandler();
+    await sigintHandler();
 
-    expect(mockDb.close).toHaveBeenCalledOnce();
     expect(mockExit).toHaveBeenCalledWith(1);
-    expect(console.error).toHaveBeenCalledWith('Error during SIGTERM shutdown:', dbError);
-
-    // Still should not call gridEngine.stop() even on error
-    expect(mockGridEngine.stop).not.toHaveBeenCalled();
   });
 
-  it('should clean up intervals even if they are null', async () => {
-    mockGridEngine.monitoringInterval = null;
-    mockGridEngine.fundingPollingInterval = null;
+  // ── Ordering guarantee ─────────────────────────────────────────────
 
-    const sigtermHandler = async () => {
-      mockGridEngine.isRunning = false;
+  it('db.close() is always called AFTER stop() resolves', async () => {
+    const callOrder: string[] = [];
+    mockGridEngine.stop.mockImplementation(async () => {
+      callOrder.push('stop');
+    });
+    mockDb.close.mockImplementation(async () => {
+      callOrder.push('close');
+    });
 
-      if (mockGridEngine.monitoringInterval) {
-        clearInterval(mockGridEngine.monitoringInterval);
-        mockGridEngine.monitoringInterval = null;
-      }
-
-      if (mockGridEngine.fundingPollingInterval) {
-        clearInterval(mockGridEngine.fundingPollingInterval);
-        mockGridEngine.fundingPollingInterval = null;
-      }
-
+    const handler = async () => {
+      await mockGridEngine.stop({ preserveOrders: true });
       await mockDb.close();
       process.exit(0);
     };
 
-    await sigtermHandler();
+    await handler();
 
-    expect(clearIntervalSpy).not.toHaveBeenCalled();
-    expect(mockDb.close).toHaveBeenCalledOnce();
-    expect(mockExit).toHaveBeenCalledWith(0);
-  });
-
-  it('should preserve orders on GRVT during SIGTERM shutdown', () => {
-    const sigtermHandler = () => {
-      mockGridEngine.isRunning = false;
-
-      if (mockGridEngine.monitoringInterval) {
-        clearInterval(mockGridEngine.monitoringInterval);
-        mockGridEngine.monitoringInterval = null;
-      }
-
-      if (mockGridEngine.fundingPollingInterval) {
-        clearInterval(mockGridEngine.fundingPollingInterval);
-        mockGridEngine.fundingPollingInterval = null;
-      }
-    };
-
-    sigtermHandler();
-
-    expect(mockGridEngine.isRunning).toBe(false);
-    expect(mockGridEngine.stop).not.toHaveBeenCalled();
+    expect(callOrder).toEqual(['stop', 'close']);
   });
 });
