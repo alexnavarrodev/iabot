@@ -7,8 +7,10 @@
 
 import { useQuery } from '@tanstack/react-query';
 import { lazy, Suspense, useEffect, useState } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { Plus } from 'lucide-react';
 import { api } from '@/lib/api-client';
+import type { WizardPreset } from '@/components/create-bot-wizard';
 import { formatPercent, formatPnl, formatUsd, formatUsdCompact } from '@/lib/format';
 import { StatCard } from '@/components/primitives/stat-card';
 import { Delta } from '@/components/primitives/delta';
@@ -49,13 +51,31 @@ export function OverviewPage() {
   });
 
   const [wizardOpen, setWizardOpen] = useState(false);
+  const [wizardPreset, setWizardPreset] = useState<WizardPreset | undefined>();
 
   // E.2: listen for keyboard shortcut `n b` dispatched from AppShell
   useEffect(() => {
-    const handler = () => setWizardOpen(true);
+    const handler = () => {
+      setWizardPreset(undefined);
+      setWizardOpen(true);
+    };
     window.addEventListener('wizard:open', handler);
     return () => window.removeEventListener('wizard:open', handler);
   }, []);
+
+  // H.6: BacktestPage navigates here with `presetWizard` in router state.
+  // Open the wizard pre-filled, then strip the state so a refresh doesn't
+  // re-open it.
+  const location = useLocation();
+  const navigate = useNavigate();
+  useEffect(() => {
+    const preset = (location.state as { presetWizard?: WizardPreset } | null)?.presetWizard;
+    if (preset) {
+      setWizardPreset(preset);
+      setWizardOpen(true);
+      navigate(location.pathname, { replace: true });
+    }
+  }, [location, navigate]);
 
   if (botsQuery.isPending) return <PageSkeleton />;
   if (botsQuery.isError) {
@@ -215,7 +235,11 @@ export function OverviewPage() {
         <Suspense fallback={null}>
           <CreateBotWizard
             open={wizardOpen}
-            onClose={() => setWizardOpen(false)}
+            onClose={() => {
+              setWizardOpen(false);
+              setWizardPreset(undefined);
+            }}
+            preset={wizardPreset}
           />
         </Suspense>
       )}

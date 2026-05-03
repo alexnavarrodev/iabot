@@ -212,6 +212,34 @@ export interface PortfolioEquityPoint {
   equity: number; // USD
 }
 
+// H.6: backtest request/response. POST /api/v2/backtest runs a pure
+// simulation against historical GRVT candles — no orders placed.
+export interface BacktestInput {
+  pair: string;
+  direction: 'long' | 'short';
+  leverage: number;
+  lower_price: number;
+  upper_price: number;
+  num_grids: number;
+  investment_usdt: number;
+  fee_pct?: number;          // default 0.05 (5 bps maker)
+  interval?: CandleInterval; // default 'CI_1_H'
+  limit?: number;            // candle count, default 500, max 1000
+}
+
+export interface BacktestResult {
+  totalProfit: number;
+  totalFees: number;
+  netProfit: number;
+  maxDrawdownPct: number;
+  roundTrips: number;
+  avgProfitPerTrip: number;
+  equityCurve: Array<{ time: number; equity: number }>;
+  daysInMarket: number;
+  profitFactor: number;
+  candlesProcessed: number;
+}
+
 export interface OrderRow {
   id: number;
   order_id: string;

@@ -13,6 +13,9 @@ export interface BacktestConfig {
   upperPrice: number;
   numGrids: number;
   investmentUSDT: number;
+  // Per-side fee in percent. 0.05 means 5 bps (GRVT maker default).
+  // Charged on both legs of a round trip → real fee impact = 2 * feePct * notional.
+  feePct?: number;
 }
 
 export interface BacktestCandle {
@@ -25,6 +28,8 @@ export interface BacktestCandle {
 
 export interface BacktestResult {
   totalProfit: number;
+  totalFees: number;
+  netProfit: number;
   maxDrawdownPct: number;
   roundTrips: number;
   avgProfitPerTrip: number;
@@ -48,7 +53,8 @@ export function runBacktest(
 ): BacktestResult {
   if (candles.length === 0) {
     return {
-      totalProfit: 0, maxDrawdownPct: 0, roundTrips: 0,
+      totalProfit: 0, totalFees: 0, netProfit: 0,
+      maxDrawdownPct: 0, roundTrips: 0,
       avgProfitPerTrip: 0, equityCurve: [], daysInMarket: 0,
       profitFactor: 0, candlesProcessed: 0,
     };
@@ -62,6 +68,8 @@ export function runBacktest(
     Math.ceil((effCap / config.numGrids / midPrice) * 100) / 100,
     minSize
   );
+  // 5 bps maker default. Charged on both legs of every round trip.
+  const feeRate = (config.feePct ?? 0.05) / 100;
 
   // Initialize grid levels
   const levels: SimLevel[] = [];
@@ -80,6 +88,7 @@ export function runBacktest(
   let maxDrawdownPct = 0;
   let grossProfit = 0;
   let grossLoss = 0;
+  let totalFees = 0;
   let roundTrips = 0;
   let positionSize = 0;
   let positionCost = 0;
@@ -110,9 +119,13 @@ export function runBacktest(
         const counterIdx = level.index - 1;
         if (counterIdx >= 0 && counterIdx < levels.length) {
           const counterLevel = levels[counterIdx]!;
-          const profit = (level.price - counterLevel.price) * level.quantity;
-          if (profit > 0) grossProfit += profit;
-          else grossLoss += Math.abs(profit);
+          const gross = (level.price - counterLevel.price) * level.quantity;
+          // Fee charged on both legs of the round trip.
+          const fee = (counterLevel.price + level.price) * level.quantity * feeRate;
+          const profit = gross - fee;
+          if (gross > 0) grossProfit += gross;
+          else grossLoss += Math.abs(gross);
+          totalFees += fee;
           roundTrips++;
           equity += profit;
         }
@@ -144,11 +157,14 @@ export function runBacktest(
   const lastTime = candles[candles.length - 1]!.time;
   const daysInMarket = Math.max(1, (lastTime - firstTime) / 86400);
 
+  const netProfit = grossProfit - grossLoss - totalFees;
   return {
     totalProfit: Math.round(grossProfit * 100) / 100,
+    totalFees: Math.round(totalFees * 100) / 100,
+    netProfit: Math.round(netProfit * 100) / 100,
     maxDrawdownPct: Math.round(maxDrawdownPct * 100) / 100,
     roundTrips,
-    avgProfitPerTrip: roundTrips > 0 ? Math.round((grossProfit / roundTrips) * 100) / 100 : 0,
+    avgProfitPerTrip: roundTrips > 0 ? Math.round((netProfit / roundTrips) * 100) / 100 : 0,
     equityCurve,
     daysInMarket: Math.round(daysInMarket),
     profitFactor: grossLoss > 0 ? Math.round((grossProfit / grossLoss) * 100) / 100 : grossProfit > 0 ? Infinity : 0,

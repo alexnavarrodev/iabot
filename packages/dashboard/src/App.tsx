@@ -22,6 +22,11 @@ const BotDetailPage = lazy(() =>
   import('./pages/bot-detail').then((m) => ({ default: m.BotDetailPage }))
 );
 
+// Backtest is form-heavy + recharts — also lazy.
+const BacktestPage = lazy(() =>
+  import('./pages/backtest').then((m) => ({ default: m.BacktestPage }))
+);
+
 function RouteFallback() {
   return (
     <div className="flex items-center justify-center h-64 text-sm text-text-muted animate-pulse">
@@ -128,6 +133,16 @@ export default function App() {
                   <ErrorBoundary>
                     <Suspense fallback={<RouteFallback />}>
                       <BotDetailPage />
+                    </Suspense>
+                  </ErrorBoundary>
+                }
+              />
+              <Route
+                path="backtest"
+                element={
+                  <ErrorBoundary>
+                    <Suspense fallback={<RouteFallback />}>
+                      <BacktestPage />
                     </Suspense>
                   </ErrorBoundary>
                 }

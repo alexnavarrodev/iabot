@@ -16,6 +16,8 @@ import {
   type FundingRow,
   type GridState,
   type HealthV2,
+  type BacktestInput,
+  type BacktestResult,
   type OrderRow,
   type PortfolioEquityPoint,
   type PortfolioSummary,
@@ -153,6 +155,14 @@ export const api = {
     request<{ points: PortfolioEquityPoint[] }>(
       `/portfolio-equity-curve?days=${days}`
     ),
+
+  // H.6: pure simulation against historical GRVT candles. The result's
+  // equityCurve is already thinned server-side to ~200 points.
+  runBacktest: (input: BacktestInput) =>
+    request<BacktestResult>('/backtest', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
 
   getRealizedSummary: (id: number) =>
     request<RealizedSummary>(`/bots/${id}/realized-summary`),

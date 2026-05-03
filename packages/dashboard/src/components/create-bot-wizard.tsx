@@ -31,9 +31,23 @@ import {
 import type { ValidateBotInput, ValidateBotResult } from '@/lib/api-types';
 import { cn } from '@/lib/cn';
 
+// Optional preset handed in from /backtest "Apply to wizard". Only the
+// numeric grid params — safety knobs (compound, SL/TP, safeguard) still
+// default to off so the user reviews them in Step 3 (Config).
+export interface WizardPreset {
+  pair: string;
+  direction: 'long' | 'short';
+  leverage: number;
+  lower_price: number;
+  upper_price: number;
+  num_grids: number;
+  investment_usdt: number;
+}
+
 interface CreateBotWizardProps {
   open: boolean;
   onClose: () => void;
+  preset?: WizardPreset;
 }
 
 interface WizardState {
@@ -90,9 +104,23 @@ const FALLBACK_PAIRS = [
 type Step = 0 | 1 | 2 | 3;
 const STEP_LABELS = ['Pair', 'Range', 'Config', 'Confirm'];
 
-export function CreateBotWizard({ open, onClose }: CreateBotWizardProps) {
+function applyPreset(preset?: WizardPreset): WizardState {
+  if (!preset) return INITIAL_STATE;
+  return {
+    ...INITIAL_STATE,
+    pair: preset.pair,
+    direction: preset.direction,
+    lower: String(preset.lower_price),
+    upper: String(preset.upper_price),
+    grids: String(preset.num_grids),
+    investment: String(preset.investment_usdt),
+    leverage: String(preset.leverage),
+  };
+}
+
+export function CreateBotWizard({ open, onClose, preset }: CreateBotWizardProps) {
   const [step, setStep] = useState<Step>(0);
-  const [state, setState] = useState<WizardState>(INITIAL_STATE);
+  const [state, setState] = useState<WizardState>(() => applyPreset(preset));
   const [validated, setValidated] = useState<ValidateBotResult | null>(null);
   const navigate = useNavigate();
 
@@ -145,7 +173,9 @@ export function CreateBotWizard({ open, onClose }: CreateBotWizardProps) {
     },
   });
 
-  // Reset on close
+  // Reset on close. Note: we reset to a *preset-less* state so the next
+  // time the user opens the wizard via the regular "New bot" CTA it
+  // starts blank. A preset only takes effect on the open it was passed in.
   function handleClose() {
     setStep(0);
     setState(INITIAL_STATE);

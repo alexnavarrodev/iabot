@@ -2106,30 +2106,58 @@ export function createV2Router(deps: V2RouterDeps): Router {
   // ── POST /api/v2/backtest ──────────────────────────────────────────
   // H.6: simulate a grid bot on historical candles. Pure computation —
   // no real orders, no DB writes. Returns profit, drawdown, roundtrips,
-  // and an equity curve for charting.
+  // and an equity curve for charting. Charges per-side fees on every
+  // round trip (default 0.05% = 5 bps maker on GRVT).
+  interface BacktestBody {
+    pair?: string;
+    direction?: 'long' | 'short';
+    leverage?: number;
+    lower_price?: number;
+    upper_price?: number;
+    num_grids?: number;
+    investment_usdt?: number;
+    fee_pct?: number;
+    interval?: string;
+    limit?: number;
+  }
+
   router.post('/backtest', asyncHandler(async (req, res) => {
-    const { pair, direction, leverage, lower_price, upper_price, num_grids,
-            investment_usdt, interval, limit: candleLimit } = (req.body ?? {}) as any;
+    const body = (req.body ?? {}) as BacktestBody;
+    const {
+      pair, direction, leverage, lower_price, upper_price, num_grids,
+      investment_usdt, fee_pct, interval, limit: candleLimit,
+    } = body;
 
     const errors: string[] = [];
     if (!pair) errors.push('pair is required');
-    if (!Number.isFinite(lower_price) || lower_price <= 0) errors.push('lower_price > 0');
-    if (!Number.isFinite(upper_price) || upper_price <= 0) errors.push('upper_price > 0');
-    if (lower_price >= upper_price) errors.push('lower < upper');
-    if (!Number.isInteger(num_grids) || num_grids < 2) errors.push('num_grids >= 2');
-    if (!Number.isFinite(investment_usdt) || investment_usdt <= 0) errors.push('investment > 0');
-    if (!Number.isFinite(leverage) || leverage < 1) errors.push('leverage >= 1');
+    if (!Number.isFinite(lower_price) || (lower_price ?? 0) <= 0) errors.push('lower_price > 0');
+    if (!Number.isFinite(upper_price) || (upper_price ?? 0) <= 0) errors.push('upper_price > 0');
+    if ((lower_price ?? 0) >= (upper_price ?? 0)) errors.push('lower < upper');
+    if (!Number.isInteger(num_grids) || (num_grids ?? 0) < 2) errors.push('num_grids >= 2');
+    if (!Number.isFinite(investment_usdt) || (investment_usdt ?? 0) <= 0) errors.push('investment > 0');
+    if (!Number.isFinite(leverage) || (leverage ?? 0) < 1) errors.push('leverage >= 1');
+    if (fee_pct != null && (!Number.isFinite(fee_pct) || fee_pct < 0 || fee_pct > 1)) {
+      errors.push('fee_pct in [0, 1]');
+    }
     if (errors.length) return res.status(400).json({ error: 'validation_failed', errors });
 
     try {
-      // Fetch historical candles
-      const klines = await grvtClient.getKlines(
-        pair,
-        interval || 'CI_1_H',
-        Math.min(candleLimit || 500, 1000)
-      );
+      // Local GrvtClient interface (line 46) types getKlines as
+      // Promise<unknown[]>. Cast to the real shape from the
+      // implementation so the .map below stays type-safe.
+      const klines = (await grvtClient.getKlines(
+        pair!,
+        interval ?? 'CI_1_H',
+        Math.min(candleLimit ?? 500, 1000)
+      )) as Array<{
+        openTime: number;
+        open: number;
+        high: number;
+        low: number;
+        close: number;
+      }>;
 
-      const candles = klines.map((k: any) => ({
+      const candles = klines.map((k) => ({
         time: k.openTime / 1000,
         open: k.open,
         high: k.high,
@@ -2139,14 +2167,28 @@ export function createV2Router(deps: V2RouterDeps): Router {
 
       const { runBacktest } = await import('../bot/backtester.js');
       const result = runBacktest(
-        { pair, direction: direction || 'long', leverage, lowerPrice: lower_price,
-          upperPrice: upper_price, numGrids: num_grids, investmentUSDT: investment_usdt },
+        {
+          pair: pair!,
+          direction: direction ?? 'long',
+          leverage: leverage!,
+          lowerPrice: lower_price!,
+          upperPrice: upper_price!,
+          numGrids: num_grids!,
+          investmentUSDT: investment_usdt!,
+          feePct: fee_pct,
+        },
         candles
       );
 
-      // Thin equity curve for response (max 200 points)
-      const step = Math.max(1, Math.floor(result.equityCurve.length / 200));
-      const thinCurve = result.equityCurve.filter((_: unknown, i: number) => i % step === 0);
+      // Thin equity curve for response. Always keep first + last point so
+      // the chart shows the actual start and end equity even if the
+      // sampling stride misses the final candle.
+      const curve = result.equityCurve;
+      const step = Math.max(1, Math.floor(curve.length / 200));
+      const thinCurve: typeof curve = [];
+      for (let i = 0; i < curve.length; i += step) thinCurve.push(curve[i]!);
+      const last = curve[curve.length - 1];
+      if (last && thinCurve[thinCurve.length - 1] !== last) thinCurve.push(last);
 
       res.json({ ...result, equityCurve: thinCurve });
     } catch (err) {
