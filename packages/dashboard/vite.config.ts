@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
@@ -52,5 +53,15 @@ export default defineConfig({
         changeOrigin: true,
       },
     },
+  },
+  test: {
+    // jsdom gives us a DOM in node so @testing-library/react can render.
+    // globals: true exposes describe/it/expect without per-file import,
+    // matching the bot/notifier convention.
+    environment: 'jsdom',
+    globals: true,
+    setupFiles: ['./tests/setup.ts'],
+    include: ['tests/**/*.test.{ts,tsx}'],
+    css: false, // tailwind compilation isn't worth it in tests
   },
 });
