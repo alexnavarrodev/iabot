@@ -430,18 +430,28 @@ export class GridEngine extends EventEmitter {
     }
   ): Promise<GRVTClient> {
     if (bot.user_id != null) {
-      try {
-        return await getGrvtClientForBot(
-          bot.user_id,
-          bot.grvt_sub_account_id ?? null,
-          db as any
-        );
-      } catch (err) {
-        log.warn(
-          `⚠️  Per-user GRVT client lookup failed for user ${bot.user_id} (bot ${bot.id ?? '?'}): ${(err as Error).message}. Falling back to singleton.`
-        );
-      }
+      // STRICT: never fall back to the operator's singleton when the
+      // bot has an owner. The previous fallback was a CRITICAL bug —
+      // any transient failure in the per-user lookup (login throttle,
+      // revoked key, missing creds) routed that user's bot orders into
+      // the OPERATOR's GRVT sub-account. Logs showed 3147 silent
+      // fallbacks in a single deployment, with bots from users like
+      // 138 (HYPE) and 224 (MSFT) placing orders against user 1's
+      // wallet. Incident: 2026-06-03.
+      //
+      // Caller is responsible for catching this throw and either
+      // skipping the tick or marking the bot errored. Either is
+      // strictly safer than running it under the wrong identity.
+      return await getGrvtClientForBot(
+        bot.user_id,
+        bot.grvt_sub_account_id ?? null,
+        db as any
+      );
     }
+    // Legacy bots with NO user_id (pre-multi-tenant rows) keep using
+    // the singleton, which is bound to the operator account. Those
+    // bots SHOULD be backfilled to user 1; until then the singleton
+    // is the right identity for them.
     return grvtClient;
   }
 
