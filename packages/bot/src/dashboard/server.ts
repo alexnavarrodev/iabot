@@ -1,5 +1,7 @@
 // Dashboard Server - Fase 3
-// Puerto 3848, auth manu/br0m2026!, integración completa con Grid Engine
+// Puerto 3848, basic auth via DASHBOARD_USER / DASHBOARD_PASS (legacy
+// /api/* endpoints only — the v2 dashboard at /dashboard/ is JWT-only).
+// Integración completa con Grid Engine.
 
 // 🚨 CRÍTICO: Forzar IPv4 ANTES de cualquier import que haga requests
 import dns from 'dns';
@@ -117,7 +119,23 @@ async function initializeServices() {
   }
 }
 
-// Basic auth middleware
+// Basic auth middleware (legacy /api/* endpoints).
+// Refuses by default — must be explicitly enabled with strong credentials
+// via env. Weak/default values (admin, change-me, short passwords) are
+// rejected at request time so an unconfigured deploy can't be probed.
+const LEGACY_AUTH_BLACKLIST = new Set([
+  '', 'admin', 'password', 'change-me', 'changeme', 'replace-me', 'test',
+]);
+const legacyAuthDisabledReason = (() => {
+  const user = process.env.DASHBOARD_USER ?? '';
+  const pass = process.env.DASHBOARD_PASS ?? '';
+  if (!user || !pass) return 'DASHBOARD_USER / DASHBOARD_PASS not set';
+  if (pass.length < 12) return 'DASHBOARD_PASS shorter than 12 chars';
+  if (LEGACY_AUTH_BLACKLIST.has(user.toLowerCase())) return 'DASHBOARD_USER is a known default';
+  if (LEGACY_AUTH_BLACKLIST.has(pass.toLowerCase())) return 'DASHBOARD_PASS is a known default';
+  return null;
+})();
+
 const basicAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
   // Skip basic auth for the v2 surface — it has its own X-Api-Key / JWT
   // auth via the v2 router middleware. Without this skip, the global
@@ -133,8 +151,13 @@ const basicAuth = (req: express.Request, res: express.Response, next: express.Ne
     return next();
   }
 
-  const authHeader = req.headers.authorization;
+  // Legacy auth refused unless explicitly configured with strong creds.
+  // Returns 503 (not 401) so probers can't tell whether the path exists.
+  if (legacyAuthDisabledReason) {
+    return res.status(503).send('legacy /api/* surface disabled');
+  }
 
+  const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Basic ')) {
     res.setHeader('WWW-Authenticate', 'Basic realm="GRVT Grid Bot Dashboard"');
     return res.status(401).send('Authentication required');
@@ -178,11 +201,16 @@ app.use(
 );
 app.use(express.json());
 
-// Debug logging middleware
-app.use((req, res, next) => {
-  console.log(`🔧 [DEBUG] ${req.method} ${req.path}`);
-  next();
-});
+// Debug logging middleware — opt-in only. Logging every single request
+// at info level blew /var/log past 11 GB on a busy day (2026-06-05
+// incident: disk filled, ENOSPC crashed pino, dashboard 502'd).
+// Enable with DEBUG_REQ=1 for short-lived diagnostics only.
+if (process.env.DEBUG_REQ === '1') {
+  app.use((req, _res, next) => {
+    console.log(`🔧 [DEBUG] ${req.method} ${req.path}`);
+    next();
+  });
+}
 
 // Health endpoint BEFORE auth (for external monitoring)
 app.get('/api/health', async (req, res) => {
@@ -1400,9 +1428,11 @@ async function startServer() {
     }
 
     httpServer.listen(PORT, () => {
-      console.log('🔧 Edison: GRVT Grid Bot Dashboard - Fase 3');
+      console.log('🔧 GRVT Grid Bot Dashboard - Fase 3');
       console.log(`🌐 Server: http://localhost:${PORT}`);
-      console.log(`🔐 Auth: ${process.env.DASHBOARD_USER} / ${process.env.DASHBOARD_PASS}`);
+      console.log(
+        `🔐 Legacy auth (/api/*): ${legacyAuthDisabledReason ? 'DISABLED — ' + legacyAuthDisabledReason : 'enabled'}`
+      );
       console.log(`💾 Database: SQLite WAL mode`);
       console.log(`🤖 Grid Engine: Listo (no iniciado automáticamente)`);
       console.log('🚀 Dashboard completo - ¡LISTO PARA TRADING!');
