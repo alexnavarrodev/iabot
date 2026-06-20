@@ -7,8 +7,12 @@ import http from 'http';
 import https from 'https';
 import dotenv from 'dotenv';
 import { Agent, fetch as undiciFetch } from 'undici';
+import { edgeBaseUrl } from './grvt-env.js';
 
 dotenv.config();
+
+// Edge auth endpoint — selected by GRVT_ENV (mainnet/testnet). See grvt-env.ts.
+const EDGE_LOGIN_URL = `${edgeBaseUrl()}/auth/api_key/login`;
 
 // 🚨 CRÍTICO: Forzar IPv4 globalmente 
 dns.setDefaultResultOrder('ipv4first');
@@ -62,7 +66,7 @@ export async function authenticateGRVT(): Promise<boolean> {
     }
 
     // Login request con IPv4 agent
-    const response = await fetchIPv4('https://edge.grvt.io/auth/api_key/login', {
+    const response = await fetchIPv4(EDGE_LOGIN_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -295,7 +299,7 @@ export async function authenticateWithKey(
   state: AuthState
 ): Promise<boolean> {
   try {
-    const response = await fetchIPv4('https://edge.grvt.io/auth/api_key/login', {
+    const response = await fetchIPv4(EDGE_LOGIN_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

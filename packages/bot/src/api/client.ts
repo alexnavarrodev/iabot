@@ -11,13 +11,14 @@ import {
   createEmptyAuthState,
 } from './auth.js';
 import { signOrder, formatSignedOrderForAPI } from './order-signer.js';
+import { marketDataBaseUrl, tradingBaseUrl } from './grvt-env.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-// Endpoints GRVT verificados por Marta
-const MARKET_DATA_URL = 'https://market-data.grvt.io/full/v1';
-const TRADING_URL = 'https://trades.grvt.io/full/v1';
+// Endpoints GRVT — selected by GRVT_ENV (mainnet/testnet). See grvt-env.ts.
+const MARKET_DATA_URL = marketDataBaseUrl();
+const TRADING_URL = tradingBaseUrl();
 
 // Tipos para las respuestas de la API
 export interface Balance {

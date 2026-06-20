@@ -56,6 +56,8 @@ secrets/
 **/src/**/*.js.map
 **/src/**/*.d.ts
 **/src/**/*.d.ts.map
+# ...but keep Vite's ambient client types (hand-written source, not a build artifact)
+!**/src/vite-env.d.ts
 **/tests/**/*.js
 **/tests/**/*.js.map
 **/tests/**/*.d.ts
