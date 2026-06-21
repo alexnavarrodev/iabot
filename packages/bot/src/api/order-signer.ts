@@ -129,6 +129,22 @@ export function roundPrice(price: string | number, tickSize: number = 0.01): str
   return roundToTickSize(p, tickSize).toString();
 }
 
+/** The instrument's tick size (price granularity). Defaults to 0.01. */
+function getTickSize(instrument: string): number {
+  return getInstrumentSpec(instrument).tick_size ?? 0.01;
+}
+
+/** Round a size DOWN to the instrument's min_size and return a clean
+ *  decimal string. MUST match the rounding inside sizeToContractSize so the
+ *  size we SIGN scales to the same contracts the size we SEND does — else
+ *  GRVT rejects with "Signature does not match payload" (code 2002). */
+function roundSizeToMinSize(size: string, instrument: string): string {
+  const minSize = getInstrumentSpec(instrument).min_size || 0.001;
+  const n = Math.floor(parseFloat(size) / minSize) * minSize;
+  const decimals = Math.max(0, Math.round(-Math.log10(minSize)));
+  return n.toFixed(decimals);
+}
+
 /**
  * Crear orden EIP-712 para firmar
  */
@@ -216,7 +232,7 @@ export async function signOrder(
   const contractSize = sizeToContractSize(size, instrument);
   
   // Para market orders, usar price actual o 0 (será ignorado por el exchange)
-  const limitPrice = isMarket ? '0' : priceToLimitPrice(price!);
+  const limitPrice = isMarket ? '0' : priceToLimitPrice(price!, getTickSize(instrument));
   const isBuyingContract = side === 'buy';
 
   // Crear orden para firmar
@@ -339,8 +355,10 @@ export function formatSignedOrderForAPI(signedOrder: SignedOrder, instrument: st
       legs: [
         {
           instrument: instrument, // ⚠️ CAMBIO: human-readable name
-          size: roundPrice(size, 0.01), // ⚠️ Rounded to min_size
-          limit_price: signedOrder.isMarket ? undefined : roundPrice(price!), // ⚠️ Rounded to tick_size
+          // Round to the instrument's REAL min_size / tick_size so the sent
+          // payload scales to exactly the contracts/price that were signed.
+          size: roundSizeToMinSize(size, instrument),
+          limit_price: signedOrder.isMarket ? undefined : roundPrice(price!, getTickSize(instrument)),
           is_buying_asset: leg.isBuyingContract, // ⚠️ CAMBIO: is_buying_asset
         },
       ],
