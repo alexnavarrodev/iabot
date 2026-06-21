@@ -437,8 +437,17 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     return String(raw ?? '').toLowerCase() === 'es' ? 'es' : 'en';
   }
 
-  // POST /api/v2/auth/signup — public.
+  // POST /api/v2/auth/signup — public, unless closed by the operator.
+  // Set DISABLE_SIGNUP=true to run a single-tenant instance: only accounts
+  // created beforehand (e.g. the owner bootstrap) can log in; new
+  // registrations are rejected.
   router.post('/auth/signup', SIGNUP_LIMITER, asyncHandler(async (req, res) => {
+    const signupDisabled = /^(1|true|yes)$/i.test(
+      (process.env.DISABLE_SIGNUP ?? '').trim()
+    );
+    if (signupDisabled) {
+      return res.status(403).json({ error: 'registration is disabled' });
+    }
     const body = (req.body ?? {}) as {
       email?: unknown;
       password?: unknown;
