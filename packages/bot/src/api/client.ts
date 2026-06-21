@@ -575,7 +575,11 @@ export class GRVTClient {
     console.log(`⚡ Estableciendo leverage ${leverage}x para ${instrument}`);
     
     try {
-      await this.authedRequest(`${TRADING_URL}/set_leverage`, {
+      // GRVT exposes this as set_initial_leverage (the old /set_leverage
+      // path 404s). Body fields match ApiSetInitialLeverageRequest. Note:
+      // GRVT only accepts a leverage change when the instrument has NO open
+      // position, so this must run before the grid opens its first order.
+      await this.authedRequest(`${TRADING_URL}/set_initial_leverage`, {
         sub_account_id: this.tradingAccountId,
         instrument: instrument,
         leverage: leverage.toString()
