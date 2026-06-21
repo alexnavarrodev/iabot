@@ -19,6 +19,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
+# Force native addons (sqlite3) to compile from source against THIS image's
+# glibc instead of downloading a prebuilt binary that may target a newer
+# glibc than the runtime stage has (else: "GLIBC_2.38 not found" at runtime).
+ENV npm_config_build_from_source=true
+
 # Install only the bot package's deps. Copying package.json + lockfile first
 # means npm install gets cached on every rebuild that doesn't change deps.
 COPY package.json package-lock.json ./
