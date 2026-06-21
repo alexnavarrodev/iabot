@@ -41,3 +41,10 @@ export function tradingBaseUrl(): string {
 export function marketDataBaseUrl(): string {
   return process.env.GRVT_MARKET_DATA_URL || `https://${host('market-data')}/full/v1`;
 }
+
+/** GRVT L2 chain id used in the EIP-712 signing domain. Must match the
+ *  target environment or GRVT rejects orders with "Signature does not match
+ *  payload" (code 2002). Values from the official GRVT SDK. */
+export function grvtChainId(): number {
+  return getGrvtEnv() === 'testnet' ? 326 : 325;
+}

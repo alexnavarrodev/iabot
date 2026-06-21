@@ -3,6 +3,7 @@
 // ⚠️ CRÍTICO: PRICE_MULTIPLIER = 1e9, NO usar quote_decimals
 
 import { SignTypedDataVersion, signTypedData } from '@metamask/eth-sig-util';
+import { grvtChainId } from './grvt-env.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -21,7 +22,7 @@ const dlog = (...args: unknown[]): void => {
 const EIP712_DOMAIN = {
   name: 'GRVT Exchange',
   version: '0',
-  chainId: 325, // GRVT Production chainId
+  chainId: grvtChainId(), // 325 mainnet / 326 testnet — must match GRVT_ENV
 };
 
 // EIP-712 Types para Order
