@@ -1,0 +1,40 @@
+# GRVT Grid — isolated single-host deployment that sits BEHIND an existing
+# reverse proxy (e.g. EasyPanel/Traefik already owning :80/:443).
+#
+# Differences vs docker-compose.yml:
+#   - No Caddy / no notifier — just the bot.
+#   - Port bound to 127.0.0.1 only (reach it via SSH tunnel or your own proxy).
+#   - AES master key bind-mounted from the host instead of baked in.
+#
+# Usage:
+#   docker compose -f docker-compose.testnet.yml up -d --build
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: packages/bot/Dockerfile
+    image: grvt-grid/bot:testnet
+    container_name: grvt-grid-bot
+    restart: unless-stopped
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      DASHBOARD_PORT: "3848"
+      MASTER_KEY_PATH: /app/secrets/master.key
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+    volumes:
+      - ./data:/app/data
+      - ./logs/bot:/app/logs
+      - /etc/grvt-grid/master.key:/app/secrets/master.key:ro
+    ports:
+      # localhost-only: not exposed to the internet. Use an SSH tunnel:
+      #   ssh -L 3848:127.0.0.1:3848 root@<vps>
+      - "127.0.0.1:3848:3848"
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://127.0.0.1:3848/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
